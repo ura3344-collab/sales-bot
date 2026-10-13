@@ -52,7 +52,7 @@ def get_cart(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
 
 def manager_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
     # MANAGER_ID зі змінних середовища має пріоритет: на хостингу база може очищатися.
-    value = os.getenv("MANAGER_ID") or storage(context).get_setting("manager_id")
+    value = os.getenv("MANAGER_ID", "").strip() or storage(context).get_setting("manager_id")
     return int(value) if value else None
 
 
@@ -441,7 +441,8 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
 
 
 def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    # Значення, вставлені у форму хостингу, часто мають зайвий перенос рядка наприкінці.
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or "..." in token:
         raise SystemExit("Вкажіть TELEGRAM_BOT_TOKEN у файлі .env (токен від @BotFather).")
 

@@ -142,6 +142,14 @@ def test_full_order_flow(run):
     run(scenario)
 
 
+def test_manager_id_from_env_ignores_whitespace(run, monkeypatch):
+    async def scenario(chat, app):
+        monkeypatch.setenv("MANAGER_ID", f" {MANAGER}\n")
+        assert "Замовлень ще немає" in texts_to(await chat.say(MANAGER, "/orders"), MANAGER)[0]
+
+    run(scenario)
+
+
 def test_cancel_keeps_cart(run):
     async def scenario(chat, app):
         await chat.press(CLIENT, "add:2")
