@@ -1,0 +1,15 @@
+# Безкоштовний деплой на Render: New → Blueprint → обрати цей репозиторій.
+services:
+  - type: web
+    name: sales-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: MANAGER_ID
+        sync: false

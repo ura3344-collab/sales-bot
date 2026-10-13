@@ -1,0 +1,16 @@
+name: keepalive
+
+# Безкоштовний сервіс Render засинає після 15 хвилин без запитів.
+# Цей пінг не дає йому заснути, тож бот відповідає одразу.
+# Адресу сервісу вкажіть у Settings → Secrets and variables → Actions → Variables → BOT_URL.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    if: vars.BOT_URL != ''
+    steps:
+      - run: curl -s -o /dev/null -m 90 -w "HTTP %{http_code}\n" "${{ vars.BOT_URL }}" || true
