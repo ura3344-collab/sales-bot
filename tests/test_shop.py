@@ -64,3 +64,24 @@ def test_find_topic():
     assert shop.find_topic("покажи кошик") == "cart"
     assert shop.find_topic("дякую!") == "thanks"
     assert shop.find_topic("абракадабра") is None
+
+
+def test_search_by_name_and_color(tmp_path):
+    items = products(tmp_path)
+    # Закінчення не важливі: «білу» знаходить «Біла», «футболки» — «Футболка».
+    assert [p.id for p in shop.search(items, "біла футболка")] == ["1"]
+    assert [p.id for p in shop.search(items, "Є у вас футболки?")] == ["1", "4"]
+    assert [p.id for p in shop.search(items, "скільки коштує худі")] == ["2"]
+    # Без значущих слів або без збігу — нічого.
+    assert shop.search(items, "ціна") == []
+    assert shop.search(items, "зелена футболка") == []
+
+
+def test_hits_skip_missing_products(tmp_path, monkeypatch):
+    monkeypatch.setattr(texts, "HITS", ["4", "99", "2"])
+    assert [p.id for p in shop.hits(products(tmp_path))] == ["4", "2"]
+
+
+def test_real_hits_exist():
+    items = shop.load_products()
+    assert [p.id for p in shop.hits(items)] == texts.HITS

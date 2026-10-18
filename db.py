@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS orders (
     payment TEXT NOT NULL DEFAULT '',
     comment TEXT NOT NULL DEFAULT '',
     total INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'new'
+    status TEXT NOT NULL DEFAULT 'new',
+    rating INTEGER
 );
 CREATE TABLE IF NOT EXISTS order_items (
     order_id INTEGER NOT NULL REFERENCES orders(id),
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 """
+NEW_COLUMNS = {"payment": "TEXT NOT NULL DEFAULT ''", "comment": "TEXT NOT NULL DEFAULT ''", "rating": "INTEGER"}
 
 
 class Storage:
@@ -38,12 +40,12 @@ class Storage:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
-        # Бази, створені до появи оплати й коментаря, отримують нові колонки.
+        # Бази, створені раніше, отримують колонки, яких тоді ще не було.
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(orders)")}
         with self.conn:
-            for column in ("payment", "comment"):
+            for column, definition in NEW_COLUMNS.items():
                 if column not in columns:
-                    self.conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                    self.conn.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
 
     def get_setting(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -94,9 +96,23 @@ class Storage:
         rows = self.conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
         return [self._with_items(r) for r in rows.fetchall()]
 
+    def orders_since(self, since: datetime) -> list[dict]:
+        """Замовлення, створені починаючи з since (за київським часом), від старих до нових."""
+        rows = self.conn.execute(
+            "SELECT * FROM orders WHERE created >= ? ORDER BY id", (since.strftime("%Y-%m-%d %H:%M"),))
+        return [self._with_items(r) for r in rows.fetchall()]
+
+    def all_orders(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM orders ORDER BY id")
+        return [self._with_items(r) for r in rows.fetchall()]
+
     def set_status(self, order_id: int, status: str) -> None:
         with self.conn:
             self.conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+
+    def set_rating(self, order_id: int, rating: int) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE orders SET rating = ? WHERE id = ?", (rating, order_id))
 
     def stats(self) -> dict:
         """Виручка й топ товарів рахуються без скасованих замовлень."""
@@ -106,7 +122,11 @@ class Storage:
         top = self.conn.execute(
             "SELECT i.title, SUM(i.qty) AS qty FROM order_items i JOIN orders o ON o.id = i.order_id "
             "WHERE o.status != 'cancelled' GROUP BY i.title ORDER BY qty DESC, i.title LIMIT 3").fetchall()
+        ratings, avg_rating = self.conn.execute(
+            "SELECT COUNT(rating), AVG(rating) FROM orders WHERE rating IS NOT NULL").fetchone()
         return {
+            "ratings": ratings,
+            "avg_rating": round(avg_rating, 1) if ratings else 0,
             "orders": sum(by_status.values()),
             "by_status": by_status,
             "revenue": revenue,

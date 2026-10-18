@@ -131,9 +131,42 @@ def delivery_note(total: int) -> str:
     return f"🚚 До безкоштовної доставки залишилось {texts.FREE_DELIVERY_FROM - total} грн."
 
 
+def _normalize(text: str) -> str:
+    return text.lower().replace("’", "'").replace("ʼ", "'")
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[\w']+", _normalize(text))
+
+
+def _stem(word: str) -> str:
+    """Відкидає закінчення, щоб «білий» знаходив «Біла», а «бежевого» — «Бежевий»."""
+    return word[:max(3, len(word) - 2)]
+
+
+def search(products: dict[str, Product], text: str) -> list[Product]:
+    """Товари, у розділі, назві чи кольорі яких є всі значущі слова запиту.
+    Короткі слова, слова-запитання («ціна», «фартух») і SEARCH_STOP_WORDS не враховуються."""
+    words = [w for w in _words(text) if len(w) >= 3 and w not in texts.SEARCH_STOP_WORDS
+             and not any(w.startswith(kw) for kw in texts.KEYWORDS["prices"])]
+    if not words:
+        return []
+    found = []
+    for p in products.values():
+        names = _words(f"{p.category} {p.model} {p.color}")
+        if all(any(n.startswith(_stem(w)) for n in names) for w in words):
+            found.append(p)
+    return found
+
+
+def hits(products: dict[str, Product]) -> list[Product]:
+    """Хіти продажу з texts.HITS, яких немає в каталозі, пропускаються."""
+    return [products[pid] for pid in texts.HITS if pid in products]
+
+
 def find_topic(text: str) -> str | None:
-    text = text.lower().replace("’", "'").replace("ʼ", "'")
-    words = re.findall(r"[\w']+", text)
+    text = _normalize(text)
+    words = _words(text)
     for topic, keywords in texts.KEYWORDS.items():
         for kw in keywords:
             if any(w.startswith(kw) for w in words) or (" " in kw and kw in text):

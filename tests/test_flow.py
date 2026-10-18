@@ -33,7 +33,7 @@ class FakeRequest(BaseRequest):
         self.calls.append((name, params))
         if name == "getMe":
             result = {"id": 1, "is_bot": True, "first_name": "Test", "username": "test_bot"}
-        elif name in ("sendMessage", "editMessageText", "editMessageReplyMarkup"):
+        elif name in ("sendMessage", "editMessageText", "editMessageReplyMarkup", "sendDocument"):
             result = {"message_id": len(self.calls), "date": 0,
                       "chat": {"id": params.get("chat_id", 1), "type": "private"},
                       "text": params.get("text", "")}
@@ -326,5 +326,124 @@ def test_checkout_with_empty_cart_is_refused(run):
         assert [name for name, _ in calls] == ["answerCallbackQuery"]
         # Розмова не почалася: звичайний текст обробляється як питання, а не як ім'я.
         assert "Доставка та оплата" in texts_to(await chat.say(CLIENT, "яка доставка?"), CLIENT)[0]
+
+    run(scenario)
+
+
+def test_search_and_hits(run, monkeypatch):
+    monkeypatch.setattr(bot.texts, "HITS", ["3", "1"])
+
+    async def scenario(chat, app):
+        calls = await chat.say(CLIENT, "Хочу білу футболку")
+        assert "знайшлося" in texts_to(calls, CLIENT)[0]
+        assert "m:1" in str(calls) and "m:2" not in str(calls)
+        # Питання не про товар працюють як раніше.
+        assert "Доставка та оплата" in texts_to(await chat.say(CLIENT, "яка доставка?"), CLIENT)[0]
+
+        calls = await chat.say(CLIENT, bot.BTN_CATALOG)
+        assert "Хіти продажу" in str(calls) and "'hits'" in str(calls)
+        calls = await chat.press(CLIENT, "hits")
+        assert "Хіти продажу" in texts_to(calls, CLIENT)[0]
+        markup = str(calls)
+        assert markup.index("m:3") < markup.index("m:1") and "Футболка базова, біла — 450 грн" in markup
+
+    run(scenario)
+
+
+def test_cart_reminder(run):
+    async def scenario(chat, app):
+        def reminder_jobs():
+            return app.job_queue.get_jobs_by_name(f"cart:{CLIENT}")
+
+        await chat.press(CLIENT, "add:2")
+        await chat.press(CLIENT, "add:1")
+        # Кожне додавання переносить нагадування, а не створює ще одне.
+        jobs = [j for j in reminder_jobs() if not j.removed]
+        assert len(jobs) == 1
+
+        chat.request.calls.clear()
+        await jobs[0].run(app)
+        assert "залишили товари" in texts_to(chat.request.calls, CLIENT)[0]
+
+        # Порожній кошик — нагадування не надсилається.
+        await chat.press(CLIENT, "clear")
+        chat.request.calls.clear()
+        await jobs[0].run(app)
+        assert texts_to(chat.request.calls, CLIENT) == []
+
+        # Після оформлення нагадування скасовується.
+        await chat.press(CLIENT, "add:2")
+        await chat.press(CLIENT, "checkout")
+        for answer in ("Ольга", "0501234567", "🏤 Нова Пошта — відділення", "Київ, 5", "💵 Накладений платіж",
+                       bot.BTN_SKIP, bot.BTN_CONFIRM):
+            await chat.say(CLIENT, answer)
+        assert all(j.removed for j in reminder_jobs())
+
+    run(scenario)
+
+
+def test_rating_after_done(run, monkeypatch):
+    monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+
+    async def scenario(chat, app):
+        db = app.bot_data["db"]
+        db.create_order(CLIENT, "user100", "Ольга", "0501234567", "Київ, 5", [("Кепка", 390, 1)])
+
+        calls = await chat.press(MANAGER, "st:1:done")
+        assert any("Оцініть" in t for t in texts_to(calls, CLIENT)) and "rate:1:5" in str(calls)
+
+        await chat.press(STRANGER, "rate:1:1")
+        assert db.get_order(1)["rating"] is None
+
+        calls = await chat.press(CLIENT, "rate:1:4")
+        assert "Дякуємо за оцінку ⭐⭐⭐⭐" in texts_to(calls, CLIENT)[0]
+        assert "Відгук на замовлення №1: ⭐⭐⭐⭐" in texts_to(calls, MANAGER)[0]
+        assert "вже оцінили" in str(await chat.press(CLIENT, "rate:1:1"))
+        assert db.get_order(1)["rating"] == 4
+
+        assert "Середня оцінка: 4.0" in texts_to(await chat.say(MANAGER, "/stats"), MANAGER)[0]
+        assert "Оцінка клієнта: ⭐⭐⭐⭐" in texts_to(await chat.press(MANAGER, "ord:1"), MANAGER)[0]
+
+    run(scenario)
+
+
+def test_report_export_and_daily_job(run, monkeypatch):
+    monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+
+    async def scenario(chat, app):
+        assert "лише менеджеру" in texts_to(await chat.say(CLIENT, "/export"), CLIENT)[0]
+        assert "Замовлень ще немає" in texts_to(await chat.say(MANAGER, "/export"), MANAGER)[0]
+
+        db = app.bot_data["db"]
+        db.create_order(CLIENT, "user100", "Ольга", "0501234567", "Київ, 5", [("Кепка", 390, 2)])
+        assert "Замовлень: 1" in texts_to(await chat.say(MANAGER, "/report"), MANAGER)[0]
+
+        calls = await chat.say(MANAGER, "/export")
+        assert [p["caption"] for name, p in calls if name == "sendDocument"] == ["📄 Усі замовлення (1 шт.)"]
+
+        # Щоденний звіт заплановано на 16:00 за Києвом.
+        [job] = app.job_queue.get_jobs_by_name("daily_report")
+        assert job.trigger.fields[5].expressions[0].first == 16  # hour
+        chat.request.calls.clear()
+        await job.run(app)
+        assert "Звіт за добу" in texts_to(chat.request.calls, MANAGER)[0]
+
+    run(scenario)
+
+
+def test_errors_are_reported_to_manager(run, monkeypatch):
+    monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+
+    def broken():
+        raise RuntimeError("каталог зламався")
+
+    async def scenario(chat, app):
+        monkeypatch.setattr(bot.shop, "load_products", broken)
+        calls = await chat.say(CLIENT, bot.BTN_CATALOG)
+        await asyncio.sleep(0.1)  # обробник помилок працює окремим завданням
+        calls += chat.request.calls
+        assert "щось пішло не так" in texts_to(calls, CLIENT)[0]
+        to_manager = texts_to(calls, MANAGER)[0]
+        assert "Помилка в боті" in to_manager and "каталог зламався" in to_manager
 
     run(scenario)

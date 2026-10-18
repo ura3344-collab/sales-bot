@@ -5,22 +5,25 @@ import html
 import logging
 import os
 import re
+import traceback
 import warnings
 from dataclasses import replace
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
 from telegram.warnings import PTBUserWarning
 
+import reports
 import shop
 import texts
-from db import Storage
+from db import KYIV, Storage
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
@@ -87,7 +90,28 @@ async def edit_or_ignore(coro) -> None:
 def categories_view(products: dict[str, shop.Product]) -> tuple[str, InlineKeyboardMarkup]:
     buttons = [[InlineKeyboardButton(name, callback_data=f"c:{i}")]
                for i, name in enumerate(shop.categories(products))]
+    if shop.hits(products):
+        buttons.insert(0, [InlineKeyboardButton(texts.HITS_BUTTON, callback_data="hits")])
     return texts.CATALOG_TITLE, InlineKeyboardMarkup(buttons)
+
+
+def product_buttons(found: list[shop.Product]) -> list[list[InlineKeyboardButton]]:
+    """Окремі товари (модель + колір) — для хітів і результатів пошуку."""
+    return [[InlineKeyboardButton(f"{p.model}{', ' + p.color.lower() if p.color else ''} — {p.price} грн",
+                                  callback_data=f"m:{p.id}")] for p in found]
+
+
+def hits_view(products: dict[str, shop.Product]) -> tuple[str, InlineKeyboardMarkup]:
+    buttons = product_buttons(shop.hits(products))
+    buttons.append([InlineKeyboardButton(texts.BTN_ALL_CATEGORIES, callback_data="cats")])
+    return texts.HITS_TITLE, InlineKeyboardMarkup(buttons)
+
+
+def search_view(found: list[shop.Product]) -> tuple[str, InlineKeyboardMarkup]:
+    text = texts.SEARCH_FOUND
+    if len(found) > texts.SEARCH_LIMIT:
+        text += "\n" + texts.SEARCH_MORE.format(shown=texts.SEARCH_LIMIT, total=len(found))
+    return text, InlineKeyboardMarkup(product_buttons(found[:texts.SEARCH_LIMIT]))
 
 
 def models_view(products: dict[str, shop.Product], category: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -221,11 +245,17 @@ def contacts_text(order: dict) -> str:
 def order_card(order: dict) -> str:
     username = f"@{order['username']}" if order["username"] else "немає"
     items = items_text([(i["title"], i["price"], i["qty"]) for i in order["items"]])
+    rating = f"\nОцінка клієнта: {reports.stars(order['rating'])}" if order.get("rating") else ""
     return (f"Замовлення №{order['id']} від {order['created']}\n"
             f"Статус: {texts.STATUSES[order['status']]}\n\n"
             f"{items}\nРазом: {order['total']} грн\n\n"
             f"{contacts_text(order)}\n"
-            f"Telegram: {username}")
+            f"Telegram: {username}{rating}")
+
+
+def rating_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"{n} ⭐", callback_data=f"rate:{order_id}:{n}")
+                                  for n in range(1, 6)]])
 
 
 def status_keyboard(order_id: int) -> InlineKeyboardMarkup:
@@ -280,6 +310,13 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     topic = shop.find_topic(update.message.text)
+    # «Latte бежевий», «купити кітель Rio» — шукаємо товар; питання про доставку чи контакти — ні.
+    if topic in (None, "prices", "order"):
+        found = shop.search(shop.load_products(), update.message.text)
+        if found:
+            text, markup = search_view(found)
+            await update.message.reply_text(text, reply_markup=markup)
+            return
     if topic == "prices":
         await catalog(update, context)
         return
@@ -299,7 +336,7 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- Каталог (inline-кнопки) ----------
 
 async def catalog_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """cats — розділи, c:<№> — моделі розділу, m:<id> — картка моделі,
+    """cats — розділи, hits — хіти продажу, c:<№> — моделі розділу, m:<id> — картка моделі,
     v:<id>:<розмір> — інший колір, s:<id>:<розмір> — інший розмір, chart:<id> — розмірна сітка."""
     query = update.callback_query
     action, _, arg = query.data.partition(":")
@@ -310,6 +347,10 @@ async def catalog_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if action == "cats":
         await query.answer()
         text, markup = categories_view(products)
+        await edit_or_ignore(query.edit_message_text(text, reply_markup=markup))
+    elif action == "hits":
+        await query.answer()
+        text, markup = hits_view(products)
         await edit_or_ignore(query.edit_message_text(text, reply_markup=markup))
     elif action == "c" and int(arg) < len(categories):
         await query.answer()
@@ -362,6 +403,34 @@ async def ask_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ---------- Кошик (inline-кнопки) ----------
 
+def schedule_cart_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Кожне додавання товару переносить нагадування: воно надійде через CART_REMINDER_HOURS
+    після останньої дії. Нагадування живе в пам'яті, тож після перезапуску бота зникає."""
+    if not context.job_queue:
+        return
+    cancel_cart_reminder(context, user_id)
+    context.job_queue.run_once(cart_reminder, timedelta(hours=texts.CART_REMINDER_HOURS),
+                               chat_id=user_id, user_id=user_id, name=f"cart:{user_id}")
+
+
+def cancel_cart_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(f"cart:{user_id}"):
+            job.schedule_removal()
+
+
+async def cart_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not shop.cart_lines(context.user_data.get("cart", {}), shop.load_products()):
+        return
+    try:
+        await context.bot.send_message(
+            context.job.chat_id, texts.CART_REMINDER,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(texts.BTN_OPEN_CART, callback_data="show")]]))
+    except Forbidden:
+        pass  # клієнт заблокував бота — нагадувати нікому
+
+
+
 async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     # key — позиція кошика: id товару, а для одягу з розмірами ще й розмір ("12:M").
@@ -385,11 +454,13 @@ async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer(texts.MAX_QTY_REACHED, show_alert=True)
     elif action == "add":
         cart[key] = cart.get(key, 0) + 1
+        schedule_cart_reminder(context, update.effective_user.id)
         await query.answer(f"Додано: {replace(p, size=size).title}")
         await edit_or_ignore(query.edit_message_reply_markup(product_markup(p, products, cart, size)))
     else:
         if action == "inc":
             cart[key] = cart.get(key, 0) + 1
+            schedule_cart_reminder(context, update.effective_user.id)
         elif action == "dec" and key in cart:
             cart[key] -= 1
             if cart[key] <= 0:
@@ -505,6 +576,7 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         user.id, user.username, order["name"], order["phone"], order["delivery"],
         [(p.title, p.price, qty) for p, qty in lines], order["payment"], order["comment"])
     cart.clear()
+    cancel_cart_reminder(context, user.id)
 
     manager = manager_id(context)
     if manager:
@@ -593,8 +665,31 @@ async def manager_set_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         await context.bot.send_message(
             order["user_id"], texts.STATUS_CHANGED.format(id=order["id"], status=texts.STATUSES[status]))
+        if status == "done" and not order["rating"]:
+            await context.bot.send_message(order["user_id"], texts.ASK_RATING.format(id=order["id"]),
+                                           reply_markup=rating_keyboard(order["id"]))
     except Exception:
         logging.exception("Не вдалося сповістити клієнта про статус замовлення №%s", order["id"])
+
+
+async def rate_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """rate:<№ замовлення>:<1–5> — клієнт оцінює своє виконане замовлення."""
+    query = update.callback_query
+    _, order_id, rating = query.data.split(":")
+    order = storage(context).get_order(int(order_id))
+    if not order or order["user_id"] != update.effective_user.id:
+        await query.answer(texts.ORDER_NOT_FOUND, show_alert=True)
+        return
+    if order["rating"]:
+        await query.answer(texts.ALREADY_RATED, show_alert=True)
+        return
+    storage(context).set_rating(order["id"], int(rating))
+    stars = reports.stars(int(rating))
+    await query.answer()
+    await edit_or_ignore(query.edit_message_text(texts.THANKS_FOR_RATING.format(stars=stars)))
+    manager = manager_id(context)
+    if manager:
+        await context.bot.send_message(manager, texts.NEW_RATING.format(id=order["id"], stars=stars))
 
 
 async def manager_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -606,6 +701,8 @@ async def manager_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
              f"Замовлень: {s['orders']}",
              f"Виручка (без скасованих): {s['revenue']} грн",
              f"Середній чек: {s['average']} грн"]
+    if s["ratings"]:
+        lines.append(f"Середня оцінка: {s['avg_rating']} ⭐ (відгуків: {s['ratings']})")
     if s["by_status"]:
         lines += ["", "За статусами:"]
         lines += [f"{label}: {s['by_status'][status]}" for status, label in texts.STATUSES.items()
@@ -614,6 +711,59 @@ async def manager_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines += ["", "Топ товарів:"]
         lines += [f"{n}. {title} — {qty} шт." for n, (title, qty) in enumerate(s["top"], 1)]
     await update.message.reply_text("\n".join(lines))
+
+
+def report_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    until = datetime.now(KYIV)
+    since = until - timedelta(days=1)
+    return reports.daily_report(storage(context).orders_since(since), since, until)
+
+
+async def daily_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    manager = manager_id(context)
+    if manager:
+        await context.bot.send_message(manager, report_text(context))
+
+
+async def manager_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_manager(update, context):
+        await update.message.reply_text(texts.MANAGER_ONLY)
+        return
+    await update.message.reply_text(report_text(context))
+
+
+async def manager_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_manager(update, context):
+        await update.message.reply_text(texts.MANAGER_ONLY)
+        return
+    orders = storage(context).all_orders()
+    if not orders:
+        await update.message.reply_text(texts.NO_ORDERS_YET)
+        return
+    await update.message.reply_document(
+        reports.orders_xlsx(orders), filename=f"orders_{datetime.now(KYIV):%Y-%m-%d}.xlsx",
+        caption=texts.EXPORT_CAPTION.format(count=len(orders)))
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Будь-яка помилка: менеджер отримує подробиці, клієнт — коротке вибачення."""
+    logging.error("Помилка під час обробки оновлення", exc_info=context.error)
+    manager = manager_id(context)
+    chat = update.effective_chat if isinstance(update, Update) else None
+    if chat and chat.id != manager:
+        try:
+            await context.bot.send_message(chat.id, texts.ERROR_FOR_USER)
+        except Exception:
+            logging.exception("Не вдалося повідомити клієнта про помилку")
+    if manager:
+        trace = "".join(traceback.format_exception(context.error))[-3000:]
+        where = f"Чат: {chat.id}\n" if chat else ""
+        try:
+            await context.bot.send_message(
+                manager, f"{texts.ERROR_ALERT}\n{html.escape(where)}<pre>{html.escape(trace)}</pre>",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            logging.exception("Не вдалося надіслати менеджеру повідомлення про помилку")
 
 
 # ---------- Запуск ----------
@@ -659,7 +809,9 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
         fallbacks=[MessageHandler(cancel, order_cancel), CommandHandler("cancel", order_cancel)],
     ))
 
-    app.add_handler(CallbackQueryHandler(catalog_action, pattern=r"^(cats|c:\d+|m:\w+|[vs]:\w+:[^:]*|chart:\w+)$"))
+    app.add_handler(CallbackQueryHandler(catalog_action,
+                                         pattern=r"^(cats|hits|c:\d+|m:\w+|[vs]:\w+:[^:]*|chart:\w+)$"))
+    app.add_handler(CallbackQueryHandler(rate_order, pattern=r"^rate:\d+:[1-5]$"))
     app.add_handler(CallbackQueryHandler(ask_manager, pattern=r"^ask:\w+:[^:]*$"))
     app.add_handler(CallbackQueryHandler(cart_action, pattern=r"^(add|inc|dec):\w+(:[^:]+)?$|^(show|clear|noop)$"))
     app.add_handler(CallbackQueryHandler(manager_open_order, pattern=r"^ord:\d+$"))
@@ -672,12 +824,18 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(CommandHandler("manager", become_manager))
     app.add_handler(CommandHandler("orders", manager_orders))
     app.add_handler(CommandHandler("stats", manager_stats))
+    app.add_handler(CommandHandler("report", manager_report))
+    app.add_handler(CommandHandler("export", manager_export))
     app.add_handler(MessageHandler(button(BTN_CATALOG), catalog))
     app.add_handler(MessageHandler(button(BTN_CART), show_cart))
     app.add_handler(MessageHandler(button(BTN_DELIVERY), delivery))
     app.add_handler(MessageHandler(button(BTN_CONTACTS), contacts))
     app.add_handler(MessageHandler(button(BTN_MY_ORDERS), my_orders))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
+    app.add_error_handler(on_error)
+
+    hour, minute = texts.REPORT_TIME
+    app.job_queue.run_daily(daily_report_job, time(hour, minute, tzinfo=KYIV), name="daily_report")
     return app
 
 

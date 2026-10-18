@@ -50,7 +50,8 @@ def test_stats_exclude_cancelled(db):
 
 
 def test_empty_stats(db):
-    assert db.stats() == {"orders": 0, "by_status": {}, "revenue": 0, "average": 0, "top": []}
+    assert db.stats() == {"orders": 0, "by_status": {}, "revenue": 0, "average": 0, "top": [],
+                          "ratings": 0, "avg_rating": 0}
 
 
 def test_settings_survive_reopen(tmp_path):
