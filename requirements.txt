@@ -2,3 +2,4 @@ python-telegram-bot[webhooks,job-queue]>=21
 python-dotenv
 tzdata
 openpyxl
+psycopg[binary]

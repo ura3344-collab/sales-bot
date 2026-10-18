@@ -845,7 +845,9 @@ def main() -> None:
     if not token or "..." in token:
         raise SystemExit("Вкажіть TELEGRAM_BOT_TOKEN у файлі .env (токен від @BotFather).")
 
-    app = build_app(token, os.getenv("DB_PATH") or BASE / "shop.db")
+    # DATABASE_URL — постійна база PostgreSQL (на Render диск очищається при кожному оновленні);
+    # без неї замовлення зберігаються у файлі shop.db.
+    app = build_app(token, os.getenv("DATABASE_URL", "").strip() or os.getenv("DB_PATH") or BASE / "shop.db")
 
     # На хостингу (Render сам задає RENDER_EXTERNAL_URL) працюємо через webhook, локально — через polling.
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")

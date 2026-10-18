@@ -1,11 +1,32 @@
+import os
+import uuid
+
 import pytest
 
 from db import Storage
 
+# Щоб перевірити й PostgreSQL, задайте TEST_DATABASE_URL. Тести працюють в окремій тимчасовій схемі
+# і не чіпають таблиць бота в тій самій базі.
+PG_URL = os.getenv("TEST_DATABASE_URL", "").strip()
 
-@pytest.fixture
-def db(tmp_path):
-    return Storage(tmp_path / "test.db")
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def db(request, tmp_path):
+    if request.param == "sqlite":
+        yield Storage(tmp_path / "test.db")
+        return
+    if not PG_URL:
+        pytest.skip("TEST_DATABASE_URL не задано")
+    import psycopg
+    schema = f"test_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(PG_URL, autocommit=True) as conn:
+        conn.execute(f"CREATE SCHEMA {schema}")
+    try:
+        separator = "&" if "?" in PG_URL else "?"
+        yield Storage(f"{PG_URL}{separator}options=-csearch_path%3D{schema}")
+    finally:
+        with psycopg.connect(PG_URL, autocommit=True) as conn:
+            conn.execute(f"DROP SCHEMA {schema} CASCADE")
 
 
 def make_order(db, user_id=100, items=(("Футболка", 450, 2), ("Худі", 1290, 1))):
@@ -81,3 +102,12 @@ def test_old_database_gets_new_columns(tmp_path):
     db = Storage(path)
     order_id = make_order(db)
     assert db.get_order(order_id)["payment"] == ""
+
+
+def test_long_telegram_ids_and_setting_overwrite(db):
+    order_id = make_order(db, user_id=8451241557)
+    assert db.get_order(order_id)["user_id"] == 8451241557
+    assert [o["id"] for o in db.user_orders(8451241557)] == [order_id]
+    db.set_setting("manager_id", "1")
+    db.set_setting("manager_id", "8451241557")
+    assert db.get_setting("manager_id") == "8451241557"
