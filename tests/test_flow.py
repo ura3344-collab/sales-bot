@@ -248,6 +248,22 @@ def test_sizes_chart_and_request_to_manager(run, tmp_path, monkeypatch):
     run(scenario)
 
 
+def test_write_manager_button(run, monkeypatch):
+    async def scenario(chat, app):
+        # Без посилання кнопки немає, є звичайне меню.
+        monkeypatch.setattr(bot.texts, "MANAGER_LINK", "")
+        calls = await chat.say(CLIENT, bot.BTN_CONTACTS)
+        assert "t.me" not in str(calls)
+
+        monkeypatch.setattr(bot.texts, "MANAGER_LINK", "https://t.me/shop_manager")
+        calls = await chat.say(CLIENT, bot.BTN_CONTACTS)
+        assert "Написати менеджеру" in str(calls) and "https://t.me/shop_manager" in str(calls)
+        calls = await chat.press(CLIENT, "ask:4:")
+        assert "https://t.me/shop_manager" in str(calls)
+
+    run(scenario)
+
+
 def test_manager_id_from_env_ignores_whitespace(run, monkeypatch):
     async def scenario(chat, app):
         monkeypatch.setenv("MANAGER_ID", f" {MANAGER}\n")

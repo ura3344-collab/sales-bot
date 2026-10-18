@@ -36,6 +36,7 @@ BTN_CANCEL = "❌ Скасувати"
 BTN_CONFIRM = "✅ Підтвердити"
 BTN_ASK_MANAGER = "📞 Замовити через менеджера"
 BTN_SIZE_CHART = "📏 Розмірна сітка"
+BTN_WRITE_MANAGER = "💬 Написати менеджеру"
 
 MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_DELIVERY, BTN_CONTACTS], [BTN_MY_ORDERS]],
                            resize_keyboard=True)
@@ -234,8 +235,15 @@ async def delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(texts.DELIVERY, reply_markup=MENU)
 
 
+def manager_chat_markup() -> InlineKeyboardMarkup | ReplyKeyboardMarkup:
+    """Кнопка, що відкриває чат з менеджером; якщо посилання не задано — звичайне меню."""
+    if not texts.MANAGER_LINK:
+        return MENU
+    return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_WRITE_MANAGER, url=texts.MANAGER_LINK)]])
+
+
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(texts.CONTACTS, reply_markup=MENU)
+    await update.message.reply_text(texts.CONTACTS, reply_markup=manager_chat_markup())
 
 
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -330,7 +338,7 @@ async def ask_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             logging.exception("Не вдалося надіслати менеджеру запит на товар під замовлення")
             manager = None
-    await query.message.reply_text(texts.ASK_SENT if manager else texts.ASK_CONTACTS, reply_markup=MENU)
+    await query.message.reply_text(texts.ASK_SENT if manager else texts.ASK_CONTACTS, reply_markup=manager_chat_markup())
 
 
 # ---------- Кошик (inline-кнопки) ----------
