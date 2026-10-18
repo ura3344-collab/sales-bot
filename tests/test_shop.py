@@ -2,10 +2,11 @@ import shop
 import texts
 
 CSV = (
-    "id,назва,ціна_грн,в_наявності,опис\n"
-    "1,Футболка,450,так,Бавовна\n"
-    "2,Худі,1290,Так,Тринитка\n"
-    "3,Кепка,390,ні,Очікується\n"
+    "id,розділ,модель,колір,ціна_грн,в_наявності,опис\n"
+    "1,Одяг,Футболка,Біла,450,так,Бавовна\n"
+    "2,Одяг,Худі,,1290,Так,Тринитка\n"
+    "3,Шапки,Кепка,,390,ні,Очікується\n"
+    "4,Одяг,Футболка,Чорна,450,так,Бавовна\n"
 )
 
 
@@ -17,8 +18,10 @@ def products(tmp_path):
 
 def test_load_products(tmp_path):
     items = products(tmp_path)
-    assert list(items) == ["1", "2", "3"]
-    assert items["1"] == shop.Product("1", "Футболка", 450, True, "Бавовна")
+    assert list(items) == ["1", "2", "3", "4"]
+    assert items["1"] == shop.Product("1", "Одяг", "Футболка", "Біла", 450, True, "Бавовна")
+    assert items["1"].title == "Футболка (біла)"
+    assert items["2"].title == "Худі"
     assert items["2"].in_stock
     assert not items["3"].in_stock
 
@@ -29,6 +32,15 @@ def test_real_catalog_is_valid():
     assert all(p.price > 0 and p.title for p in items.values())
     # Для кожного товару справжнього каталогу є фото в photos/.
     assert [pid for pid in items if not shop.photo_path(pid)] == []
+
+
+def test_categories_models_and_variants(tmp_path):
+    items = products(tmp_path)
+    assert shop.categories(items) == ["Одяг", "Шапки"]
+    models = shop.models(items, "Одяг")
+    assert list(models) == ["Футболка", "Худі"]
+    assert [p.color for p in models["Футболка"]] == ["Біла", "Чорна"]
+    assert [p.id for p in shop.variants(items, items["4"])] == ["1", "4"]
 
 
 def test_cart_skips_unavailable_and_unknown(tmp_path):

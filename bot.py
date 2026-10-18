@@ -8,7 +8,7 @@ import warnings
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -71,33 +71,84 @@ async def edit_or_ignore(coro) -> None:
 
 # ---------- Вигляд повідомлень ----------
 
+def categories_view(products: dict[str, shop.Product]) -> tuple[str, InlineKeyboardMarkup]:
+    buttons = [[InlineKeyboardButton(name, callback_data=f"c:{i}")]
+               for i, name in enumerate(shop.categories(products))]
+    return texts.CATALOG_TITLE, InlineKeyboardMarkup(buttons)
+
+
+def models_view(products: dict[str, shop.Product], category: str) -> tuple[str, InlineKeyboardMarkup]:
+    buttons = []
+    for model, variants in shop.models(products, category).items():
+        prices = {v.price for v in variants}
+        price = f"{min(prices)} грн" if len(prices) == 1 else f"від {min(prices)} грн"
+        buttons.append([InlineKeyboardButton(f"{model} — {price}", callback_data=f"m:{variants[0].id}")])
+    buttons.append([InlineKeyboardButton(texts.BTN_ALL_CATEGORIES, callback_data="cats")])
+    return texts.MODELS_TITLE.format(category=category), InlineKeyboardMarkup(buttons)
+
+
 def product_caption(p: shop.Product) -> str:
     stock = "" if p.in_stock else f" ({texts.OUT_OF_STOCK})"
-    return f"{p.title} — {p.price} грн{stock}\n{p.description}"
+    color = f"\nКолір: {p.color}" if p.color else ""
+    return f"{p.model} — {p.price} грн{stock}{color}\n\n{p.description}"
 
 
-def product_markup(p: shop.Product, cart: dict[str, int]) -> InlineKeyboardMarkup:
+def product_markup(p: shop.Product, products: dict[str, shop.Product], cart: dict[str, int]) -> InlineKeyboardMarkup:
+    rows = []
+    variants = shop.variants(products, p)
+    if len(variants) > 1:
+        colors = [InlineKeyboardButton(f"✓ {v.color}" if v.id == p.id else v.color, callback_data=f"v:{v.id}")
+                  for v in variants]
+        rows += [colors[i:i + 3] for i in range(0, len(colors), 3)]
     row = []
     if p.in_stock:
         qty = cart.get(p.id, 0)
         row.append(InlineKeyboardButton(f"➕ Додати (у кошику: {qty})" if qty else "➕ Додати",
                                         callback_data=f"add:{p.id}"))
     row.append(InlineKeyboardButton(BTN_CART, callback_data="show"))
-    return InlineKeyboardMarkup([row])
+    rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
-async def send_product(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Product, cart: dict[str, int]) -> None:
-    caption, markup = product_caption(p), product_markup(p, cart)
+def photo_input(context: ContextTypes.DEFAULT_TYPE, path: Path) -> tuple[tuple, str | Path]:
+    """Файл завантажується в Telegram один раз, далі надсилаємо його file_id — так швидше.
+    У ключі є час зміни файлу, тож нове фото з тією ж назвою підхопиться саме."""
+    key = (str(path), path.stat().st_mtime_ns)
+    return key, context.bot_data.setdefault("photo_ids", {}).get(key, path)
+
+
+def remember_photo(context: ContextTypes.DEFAULT_TYPE, key: tuple, message) -> None:
+    if message and message.photo:
+        context.bot_data["photo_ids"][key] = message.photo[-1].file_id
+
+
+async def send_product(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Product,
+                       products: dict[str, shop.Product]) -> None:
+    caption, markup = product_caption(p), product_markup(p, products, get_cart(context))
     path = shop.photo_path(p.id)
     if not path:
         await message.reply_text(caption, reply_markup=markup)
         return
-    # Файл завантажується в Telegram один раз, далі надсилаємо його file_id — так швидше.
-    # У ключі є час зміни файлу, тож нове фото з тією ж назвою підхопиться саме.
-    cache = context.bot_data.setdefault("photo_ids", {})
-    key = (str(path), path.stat().st_mtime_ns)
-    sent = await message.reply_photo(cache.get(key, path), caption=caption, reply_markup=markup)
-    cache[key] = sent.photo[-1].file_id
+    key, photo = photo_input(context, path)
+    remember_photo(context, key, await message.reply_photo(photo, caption=caption, reply_markup=markup))
+
+
+async def switch_variant(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Product,
+                         products: dict[str, shop.Product]) -> None:
+    """Показує інший колір у тій самій картці: міняє фото, підпис і кнопки."""
+    caption, markup = product_caption(p), product_markup(p, products, get_cart(context))
+    path = shop.photo_path(p.id)
+    if path and message.photo:
+        key, photo = photo_input(context, path)
+        sent = await message.edit_media(InputMediaPhoto(photo, caption=caption), reply_markup=markup)
+        remember_photo(context, key, sent)
+    elif message.photo:
+        await edit_or_ignore(message.edit_caption(caption, reply_markup=markup))
+    elif path:
+        # Текстову картку не можна перетворити на фото — надсилаємо нову.
+        await send_product(message, context, p, products)
+    else:
+        await edit_or_ignore(message.edit_text(caption, reply_markup=markup))
 
 
 def items_text(items: list[tuple[str, int, int]]) -> str:
@@ -145,10 +196,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cart = get_cart(context)
-    await update.message.reply_text(texts.CATALOG_TITLE)
-    for p in shop.load_products().values():
-        await send_product(update.message, context, p, cart)
+    text, markup = categories_view(shop.load_products())
+    await update.message.reply_text(text, reply_markup=markup)
 
 
 async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -195,6 +244,32 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(answers.get(topic, texts.UNKNOWN), reply_markup=MENU)
 
 
+# ---------- Каталог (inline-кнопки) ----------
+
+async def catalog_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cats — список розділів, c:<№> — моделі розділу, m:<id> — картка моделі, v:<id> — інший колір."""
+    query = update.callback_query
+    action, _, arg = query.data.partition(":")
+    products = shop.load_products()
+    categories = shop.categories(products)
+    if action == "cats":
+        await query.answer()
+        text, markup = categories_view(products)
+        await edit_or_ignore(query.edit_message_text(text, reply_markup=markup))
+    elif action == "c" and int(arg) < len(categories):
+        await query.answer()
+        text, markup = models_view(products, categories[int(arg)])
+        await edit_or_ignore(query.edit_message_text(text, reply_markup=markup))
+    elif action == "m" and arg in products:
+        await query.answer()
+        await send_product(query.message, context, products[arg], products)
+    elif action == "v" and arg in products:
+        await query.answer(products[arg].color)
+        await switch_variant(query.message, context, products[arg], products)
+    else:
+        await query.answer(texts.CATALOG_CHANGED, show_alert=True)
+
+
 # ---------- Кошик (inline-кнопки) ----------
 
 async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -217,7 +292,7 @@ async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "add":
         cart[pid] = cart.get(pid, 0) + 1
         await query.answer(f"Додано: {products[pid].title}")
-        await edit_or_ignore(query.edit_message_reply_markup(product_markup(products[pid], cart)))
+        await edit_or_ignore(query.edit_message_reply_markup(product_markup(products[pid], products, cart)))
     else:
         if action == "inc":
             cart[pid] = cart.get(pid, 0) + 1
@@ -437,6 +512,7 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
         fallbacks=[MessageHandler(cancel, order_cancel), CommandHandler("cancel", order_cancel)],
     ))
 
+    app.add_handler(CallbackQueryHandler(catalog_action, pattern=r"^(cats|c:\d+|m:\w+|v:\w+)$"))
     app.add_handler(CallbackQueryHandler(cart_action, pattern=r"^(add|inc|dec):\w+$|^(show|clear|noop)$"))
     app.add_handler(CallbackQueryHandler(manager_open_order, pattern=r"^ord:\d+$"))
     app.add_handler(CallbackQueryHandler(manager_set_status, pattern=r"^st:\d+:\w+$"))

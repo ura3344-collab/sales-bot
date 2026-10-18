@@ -14,11 +14,18 @@ MAX_QTY = 20
 
 @dataclass(frozen=True)
 class Product:
+    """Один варіант товару, який можна покласти в кошик: модель певного кольору."""
     id: str
-    title: str
+    category: str
+    model: str
+    color: str
     price: int
     in_stock: bool
     description: str
+
+    @property
+    def title(self) -> str:
+        return f"{self.model} ({self.color.lower()})" if self.color else self.model
 
 
 def load_products(path: Path | None = None) -> dict[str, Product]:
@@ -28,13 +35,34 @@ def load_products(path: Path | None = None) -> dict[str, Product]:
     return {
         r["id"].strip(): Product(
             id=r["id"].strip(),
-            title=r["назва"].strip(),
+            category=r["розділ"].strip(),
+            model=r["модель"].strip(),
+            color=r["колір"].strip(),
             price=int(r["ціна_грн"]),
             in_stock=r["в_наявності"].strip().lower() == "так",
             description=r["опис"].strip(),
         )
         for r in rows
     }
+
+
+def categories(products: dict[str, Product]) -> list[str]:
+    """Розділи каталогу в порядку, в якому вони йдуть у products.csv."""
+    return list(dict.fromkeys(p.category for p in products.values()))
+
+
+def models(products: dict[str, Product], category: str) -> dict[str, list[Product]]:
+    """Моделі розділу, а для кожної — її кольори."""
+    result: dict[str, list[Product]] = {}
+    for p in products.values():
+        if p.category == category:
+            result.setdefault(p.model, []).append(p)
+    return result
+
+
+def variants(products: dict[str, Product], product: Product) -> list[Product]:
+    """Усі кольори тієї самої моделі."""
+    return models(products, product.category)[product.model]
 
 
 def photo_path(product_id: str, photos_dir: Path | None = None) -> Path | None:

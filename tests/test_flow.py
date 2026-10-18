@@ -37,7 +37,7 @@ class FakeRequest(BaseRequest):
             result = {"message_id": len(self.calls), "date": 0,
                       "chat": {"id": params.get("chat_id", 1), "type": "private"},
                       "text": params.get("text", "")}
-        elif name == "sendPhoto":
+        elif name in ("sendPhoto", "editMessageMedia"):
             result = {"message_id": len(self.calls), "date": 0,
                       "chat": {"id": params.get("chat_id", 1), "type": "private"},
                       "caption": params.get("caption", ""),
@@ -69,9 +69,14 @@ class Chat:
             message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text)}]
         return await self._send({"message": message})
 
-    async def press(self, user_id, data):
+    async def press(self, user_id, data, on_photo=False):
+        """Натискання inline-кнопки; on_photo — кнопка під фото, а не під текстом."""
         message = {"message_id": 1, "date": 0, "chat": {"id": user_id, "type": "private"},
-                   "from": {"id": 1, "is_bot": True, "first_name": "Test"}, "text": "…"}
+                   "from": {"id": 1, "is_bot": True, "first_name": "Test"}}
+        if on_photo:
+            message.update(caption="…", photo=[{"file_id": "OLD", "file_unique_id": "o", "width": 1, "height": 1}])
+        else:
+            message["text"] = "…"
         return await self._send({"callback_query": {"id": str(self.update_id), "from": self._user(user_id),
                                                     "chat_instance": "x", "data": data, "message": message}})
 
@@ -106,8 +111,11 @@ def test_full_order_flow(run):
         assert "Вітаю" in texts_to(await chat.say(CLIENT, "/start"), CLIENT)[0]
         assert "Менеджера" not in texts_to(await chat.say(MANAGER, "/manager"), MANAGER)[0]
 
-        catalog = texts_to(await chat.say(CLIENT, bot.BTN_CATALOG), CLIENT)
-        assert "Худі оверсайз сіре — 1290 грн" in "\n".join(catalog)
+        calls = await chat.say(CLIENT, bot.BTN_CATALOG)
+        assert "Оберіть розділ" in texts_to(calls, CLIENT)[0]
+        assert "Футболки" in str(calls) and "Кепки" in str(calls)
+        calls = await chat.press(CLIENT, "c:1")
+        assert "Худі" in texts_to(calls, CLIENT)[0] and "Худі оверсайз — 1290 грн" in str(calls)
 
         # Товару №4 немає в наявності — у кошик він не потрапляє.
         await chat.press(CLIENT, "add:4")
@@ -151,28 +159,43 @@ def test_full_order_flow(run):
     run(scenario)
 
 
-def test_catalog_sends_photo_cards(run, tmp_path, monkeypatch):
+def test_model_card_with_photos_and_colors(run, tmp_path, monkeypatch):
     photos = tmp_path / "photos"
     photos.mkdir()
-    (photos / "3.jpg").write_bytes(b"fake jpeg")
+    for pid in ("1", "2"):
+        (photos / f"{pid}.jpg").write_bytes(b"fake jpeg")
     monkeypatch.setattr(bot.shop, "PHOTOS_DIR", photos)
 
     async def scenario(chat, app):
-        calls = await chat.say(CLIENT, "/catalog")
-        sent = [(name, p.get("caption") or p.get("text")) for name, p in calls if name in ("sendMessage", "sendPhoto")]
-        # Заголовок і по картці на кожен товар; фото є лише в худі.
-        assert len(sent) == 5
-        assert [c for name, c in sent if name == "sendPhoto"] == [
-            "Худі оверсайз сіре — 1290 грн\nТринитка з начосом, розміри M–XL"]
+        # Модель відкривається карткою з фото першого кольору і кнопками всіх кольорів.
+        calls = await chat.press(CLIENT, "m:1")
+        card = next(p for name, p in calls if name == "sendPhoto")
+        assert card["caption"] == "Футболка базова — 450 грн\nКолір: Біла\n\n100% бавовна, розміри S–XXL"
+        assert "✓ Біла" in str(card["reply_markup"]) and "Чорна" in str(card["reply_markup"])
+
+        # Інший колір — та сама картка з новим фото, підписом і позначкою ✓.
+        calls = await chat.press(CLIENT, "v:2", on_photo=True)
+        edit = next(p for name, p in calls if name == "editMessageMedia")
+        assert "Колір: Чорна" in str(edit["media"]) and "✓ Чорна" in str(edit["reply_markup"])
 
         # Удруге фото не завантажується, а йде за file_id від Telegram.
-        calls = await chat.say(CLIENT, "/catalog")
+        calls = await chat.press(CLIENT, "m:1")
         assert [p["photo"] for name, p in calls if name == "sendPhoto"] == ["PHOTO_ID"]
 
-        # Кнопка на картці показує, скільки цього товару вже в кошику.
-        calls = await chat.press(CLIENT, "add:3")
+        # Товар без фото показується текстовою карткою; у моделі з одним кольором кнопок кольорів немає.
+        calls = await chat.press(CLIENT, "m:3")
+        assert "Худі оверсайз — 1290 грн\nКолір: Сіре" in texts_to(calls, CLIENT)[0]
+        assert "v:" not in str(calls)
+
+        # Кнопка на картці показує, скільки цього кольору вже в кошику, а кошик — який саме колір.
+        calls = await chat.press(CLIENT, "add:2", on_photo=True)
         markup = next(p["reply_markup"] for name, p in calls if name == "editMessageReplyMarkup")
         assert "у кошику: 1" in str(markup)
+        assert "Футболка базова (чорна)" in texts_to(await chat.say(CLIENT, "/cart"), CLIENT)[0]
+
+        # Застаріла кнопка після зміни каталогу не ламає бота.
+        calls = await chat.press(CLIENT, "c:9")
+        assert "Каталог оновився" in str(calls)
 
     run(scenario)
 
@@ -190,7 +213,7 @@ def test_cancel_keeps_cart(run):
         await chat.press(CLIENT, "add:2")
         await chat.press(CLIENT, "checkout")
         assert "скасовано" in texts_to(await chat.say(CLIENT, bot.BTN_CANCEL), CLIENT)[0]
-        assert "Футболка базова чорна" in texts_to(await chat.say(CLIENT, "/cart"), CLIENT)[0]
+        assert "Футболка базова (чорна)" in texts_to(await chat.say(CLIENT, "/cart"), CLIENT)[0]
         assert app.bot_data["db"].recent_orders() == []
 
     run(scenario)
