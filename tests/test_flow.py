@@ -187,6 +187,8 @@ def test_model_card_with_photos_and_colors(run, tmp_path, monkeypatch):
         calls = await chat.press(CLIENT, "v:2:", on_photo=True)
         edit = next(p for name, p in calls if name == "editMessageMedia")
         assert "Колір: Чорна" in str(edit["media"]) and "✓ Чорна" in str(edit["reply_markup"])
+        # Фото має завантажуватися файлом: посилання file:// справжній Telegram відхиляє.
+        assert "attach://" in str(edit["media"]) and "file://" not in str(edit["media"])
 
         # Удруге фото не завантажується, а йде за file_id від Telegram.
         calls = await chat.press(CLIENT, "m:1")

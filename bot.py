@@ -173,6 +173,10 @@ async def switch_variant(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Pr
     path = shop.photo_path(p.id)
     if path and message.photo and new_photo:
         key, photo = photo_input(context, path)
+        # У InputMediaPhoto шлях до файлу перетворюється на посилання file://, яке Telegram не приймає,
+        # тому передаємо сам вміст файлу — так фото справді завантажується.
+        if isinstance(photo, Path):
+            photo = photo.read_bytes()
         sent = await message.edit_media(InputMediaPhoto(photo, caption=caption), reply_markup=markup)
         remember_photo(context, key, sent)
     elif message.photo:
