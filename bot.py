@@ -37,6 +37,9 @@ BTN_CONFIRM = "✅ Підтвердити"
 BTN_ASK_MANAGER = "📞 Замовити через менеджера"
 BTN_SIZE_CHART = "📏 Розмірна сітка"
 BTN_WRITE_MANAGER = "💬 Написати менеджеру"
+BTN_SAME_DATA = "✅ Так, ті самі дані"
+BTN_NEW_DATA = "✏️ Ввести нові"
+BTN_SKIP = "⏭ Пропустити"
 
 MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_DELIVERY, BTN_CONTACTS], [BTN_MY_ORDERS]],
                            resize_keyboard=True)
@@ -44,8 +47,12 @@ CANCEL_KB = ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True)
 PHONE_KB = ReplyKeyboardMarkup([[KeyboardButton("📱 Надіслати мій номер", request_contact=True)], [BTN_CANCEL]],
                                resize_keyboard=True)
 CONFIRM_KB = ReplyKeyboardMarkup([[BTN_CONFIRM, BTN_CANCEL]], resize_keyboard=True)
+REUSE_KB = ReplyKeyboardMarkup([[BTN_SAME_DATA], [BTN_NEW_DATA], [BTN_CANCEL]], resize_keyboard=True)
+DELIVERY_KB = ReplyKeyboardMarkup([[m] for m in texts.DELIVERY_METHODS] + [[BTN_CANCEL]], resize_keyboard=True)
+PAYMENT_KB = ReplyKeyboardMarkup([[m] for m in texts.PAYMENT_METHODS] + [[BTN_CANCEL]], resize_keyboard=True)
+COMMENT_KB = ReplyKeyboardMarkup([[BTN_SKIP], [BTN_CANCEL]], resize_keyboard=True)
 
-NAME, PHONE, DELIVERY, CONFIRM = range(4)
+REUSE, NAME, PHONE, DELIVERY_METHOD, DELIVERY, PAYMENT, COMMENT, CONFIRM = range(8)
 
 
 def storage(context: ContextTypes.DEFAULT_TYPE) -> Storage:
@@ -197,15 +204,23 @@ def cart_view(cart: dict[str, int], products: dict[str, shop.Product]) -> tuple[
     return text, InlineKeyboardMarkup(buttons)
 
 
+def contacts_text(order: dict) -> str:
+    """Дані клієнта із замовлення; оплата й коментар — лише якщо вказані."""
+    lines = [f"Ім'я: {order['name']}", f"Телефон: {order['phone']}", f"Доставка: {order['delivery']}"]
+    if order.get("payment"):
+        lines.append(f"Оплата: {order['payment']}")
+    if order.get("comment"):
+        lines.append(f"Коментар: {order['comment']}")
+    return "\n".join(lines)
+
+
 def order_card(order: dict) -> str:
     username = f"@{order['username']}" if order["username"] else "немає"
     items = items_text([(i["title"], i["price"], i["qty"]) for i in order["items"]])
     return (f"Замовлення №{order['id']} від {order['created']}\n"
             f"Статус: {texts.STATUSES[order['status']]}\n\n"
             f"{items}\nРазом: {order['total']} грн\n\n"
-            f"Ім'я: {order['name']}\n"
-            f"Телефон: {order['phone']}\n"
-            f"Доставка: {order['delivery']}\n"
+            f"{contacts_text(order)}\n"
             f"Telegram: {username}")
 
 
@@ -391,8 +406,28 @@ async def checkout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
     await query.answer()
     context.user_data["order"] = {}
+    # Клієнт уже замовляв — пропонуємо не вводити ім'я, телефон і адресу знову.
+    previous = storage(context).last_contacts(update.effective_user.id)
+    if previous:
+        context.user_data["previous"] = previous
+        await query.message.reply_text(f"{texts.REUSE_CONTACTS}\n\n{contacts_text(previous)}", reply_markup=REUSE_KB)
+        return REUSE
     await query.message.reply_text(texts.ASK_NAME, reply_markup=CANCEL_KB)
     return NAME
+
+
+async def order_reuse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    if text == BTN_SAME_DATA:
+        context.user_data["order"].update(context.user_data.pop("previous"))
+        await update.message.reply_text(texts.ASK_PAYMENT, reply_markup=PAYMENT_KB)
+        return PAYMENT
+    if text == BTN_NEW_DATA:
+        context.user_data.pop("previous", None)
+        await update.message.reply_text(texts.ASK_NAME, reply_markup=CANCEL_KB)
+        return NAME
+    await update.message.reply_text(texts.USE_BUTTONS, reply_markup=REUSE_KB)
+    return REUSE
 
 
 async def order_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -410,20 +445,45 @@ async def order_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             await update.message.reply_text(texts.BAD_PHONE, reply_markup=PHONE_KB)
             return PHONE
     context.user_data["order"]["phone"] = phone
-    await update.message.reply_text(texts.ASK_DELIVERY, reply_markup=CANCEL_KB)
+    await update.message.reply_text(texts.ASK_DELIVERY_METHOD, reply_markup=DELIVERY_KB)
+    return DELIVERY_METHOD
+
+
+async def order_delivery_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    method = update.message.text
+    if method not in texts.DELIVERY_METHODS:
+        await update.message.reply_text(texts.USE_BUTTONS, reply_markup=DELIVERY_KB)
+        return DELIVERY_METHOD
+    context.user_data["order"]["delivery_method"] = method
+    await update.message.reply_text(texts.DELIVERY_METHODS[method], reply_markup=CANCEL_KB)
     return DELIVERY
 
 
 async def order_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     order = context.user_data["order"]
-    order["delivery"] = update.message.text
+    order["delivery"] = f"{order.pop('delivery_method')}, {update.message.text}"
+    await update.message.reply_text(texts.ASK_PAYMENT, reply_markup=PAYMENT_KB)
+    return PAYMENT
+
+
+async def order_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    payment = update.message.text
+    if payment not in texts.PAYMENT_METHODS:
+        await update.message.reply_text(texts.USE_BUTTONS, reply_markup=PAYMENT_KB)
+        return PAYMENT
+    context.user_data["order"]["payment"] = payment
+    await update.message.reply_text(texts.ASK_COMMENT, reply_markup=COMMENT_KB)
+    return COMMENT
+
+
+async def order_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    order = context.user_data["order"]
+    order["comment"] = "" if update.message.text == BTN_SKIP else update.message.text
     lines = shop.cart_lines(get_cart(context), shop.load_products())
     total = shop.cart_total(lines)
     summary = (f"{texts.CHECK_ORDER}\n\n{items_text([(p.title, p.price, qty) for p, qty in lines])}\n"
                f"Разом: {total} грн\n{shop.delivery_note(total)}\n\n"
-               f"Ім'я: {order['name']}\n"
-               f"Телефон: {order['phone']}\n"
-               f"Доставка: {order['delivery']}")
+               f"{contacts_text(order)}")
     await update.message.reply_text(summary, reply_markup=CONFIRM_KB)
     return CONFIRM
 
@@ -439,7 +499,7 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user = update.effective_user
     order_id = storage(context).create_order(
         user.id, user.username, order["name"], order["phone"], order["delivery"],
-        [(p.title, p.price, qty) for p, qty in lines])
+        [(p.title, p.price, qty) for p, qty in lines], order["payment"], order["comment"])
     cart.clear()
 
     manager = manager_id(context)
@@ -453,12 +513,16 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     else:
         logging.warning("Менеджера не призначено — замовлення №%s збережено лише в базі", order_id)
 
-    await update.message.reply_text(texts.ORDER_DONE.format(id=order_id), reply_markup=MENU)
+    done = texts.ORDER_DONE.format(id=order_id)
+    if order["payment"] == texts.PAYMENT_METHODS[1]:
+        done += f"\n{texts.CARD_PAYMENT_NOTE}"
+    await update.message.reply_text(done, reply_markup=MENU)
     return ConversationHandler.END
 
 
 async def order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("order", None)
+    context.user_data.pop("previous", None)
     await update.message.reply_text(texts.ORDER_CANCELLED, reply_markup=MENU)
     return ConversationHandler.END
 
@@ -579,9 +643,13 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(checkout_start, pattern="^checkout$")],
         states={
+            REUSE: [MessageHandler(answer, order_reuse)],
             NAME: [MessageHandler(answer, order_name)],
             PHONE: [MessageHandler(filters.CONTACT | answer, order_phone)],
+            DELIVERY_METHOD: [MessageHandler(answer, order_delivery_method)],
             DELIVERY: [MessageHandler(answer, order_delivery)],
+            PAYMENT: [MessageHandler(answer, order_payment)],
+            COMMENT: [MessageHandler(answer, order_comment)],
             CONFIRM: [MessageHandler(button(BTN_CONFIRM), order_confirm)],
         },
         fallbacks=[MessageHandler(cancel, order_cancel), CommandHandler("cancel", order_cancel)],

@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS orders (
     name TEXT NOT NULL,
     phone TEXT NOT NULL,
     delivery TEXT NOT NULL,
+    payment TEXT NOT NULL DEFAULT '',
+    comment TEXT NOT NULL DEFAULT '',
     total INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'new'
 );
@@ -36,6 +38,12 @@ class Storage:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        # Бази, створені до появи оплати й коментаря, отримують нові колонки.
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(orders)")}
+        with self.conn:
+            for column in ("payment", "comment"):
+                if column not in columns:
+                    self.conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 
     def get_setting(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -46,15 +54,15 @@ class Storage:
             self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
     def create_order(self, user_id: int, username: str | None, name: str, phone: str, delivery: str,
-                     items: list[tuple[str, int, int]]) -> int:
+                     items: list[tuple[str, int, int]], payment: str = "", comment: str = "") -> int:
         """items — список (назва, ціна, кількість). Повертає номер замовлення."""
         created = datetime.now(KYIV).strftime("%Y-%m-%d %H:%M")
         total = sum(price * qty for _, price, qty in items)
         with self.conn:
             cur = self.conn.execute(
-                "INSERT INTO orders (created, user_id, username, name, phone, delivery, total) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (created, user_id, username, name, phone, delivery, total))
+                "INSERT INTO orders (created, user_id, username, name, phone, delivery, payment, comment, total) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (created, user_id, username, name, phone, delivery, payment, comment, total))
             self.conn.executemany(
                 "INSERT INTO order_items (order_id, title, price, qty) VALUES (?, ?, ?, ?)",
                 [(cur.lastrowid, title, price, qty) for title, price, qty in items])
@@ -75,6 +83,12 @@ class Storage:
         rows = self.conn.execute(
             "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
         return [self._with_items(r) for r in rows.fetchall()]
+
+    def last_contacts(self, user_id: int) -> dict | None:
+        """Ім'я, телефон і доставка з останнього замовлення клієнта — щоб не вводити їх знову."""
+        row = self.conn.execute(
+            "SELECT name, phone, delivery FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+        return dict(row) if row else None
 
     def recent_orders(self, limit: int = 10) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))

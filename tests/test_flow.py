@@ -129,14 +129,24 @@ def test_full_order_flow(run):
         assert "звертатися" in texts_to(await chat.press(CLIENT, "checkout"), CLIENT)[0]
         await chat.say(CLIENT, "Ольга Шевченко")
         assert "неповний" in texts_to(await chat.say(CLIENT, "12345"), CLIENT)[0]
-        await chat.say(CLIENT, "050 123 45 67")
-        summary = texts_to(await chat.say(CLIENT, "Київ, відділення 5"), CLIENT)[0]
+        assert "спосіб доставки" in texts_to(await chat.say(CLIENT, "050 123 45 67"), CLIENT)[0]
+        # Спосіб доставки й оплата обираються лише кнопками.
+        assert "кнопкою" in texts_to(await chat.say(CLIENT, "Київ"), CLIENT)[0]
+        assert "поштомата" in texts_to(await chat.say(CLIENT, "📦 Нова Пошта — поштомат"), CLIENT)[0]
+        assert "оплатити" in texts_to(await chat.say(CLIENT, "Київ, 1234"), CLIENT)[0]
+        assert "кнопкою" in texts_to(await chat.say(CLIENT, "готівкою"), CLIENT)[0]
+        assert "коментар" in texts_to(await chat.say(CLIENT, "💳 Переказ на картку"), CLIENT)[0]
+        summary = texts_to(await chat.say(CLIENT, "Подзвоніть перед відправкою"), CLIENT)[0]
         assert "Разом: 1740 грн" in summary and "Ольга Шевченко" in summary
+        assert "Доставка: 📦 Нова Пошта — поштомат, Київ, 1234" in summary
+        assert "Оплата: 💳 Переказ на картку" in summary and "Коментар: Подзвоніть перед відправкою" in summary
 
         calls = await chat.say(CLIENT, bot.BTN_CONFIRM)
-        assert "Замовлення №1 прийнято" in texts_to(calls, CLIENT)[0]
+        done = texts_to(calls, CLIENT)[0]
+        assert "Замовлення №1 прийнято" in done and "Реквізити" in done
         to_manager = texts_to(calls, MANAGER)[0]
         assert "Нове замовлення" in to_manager and "050 123 45 67" in to_manager and "@user100" in to_manager
+        assert "Переказ на картку" in to_manager and "Подзвоніть перед відправкою" in to_manager
 
         # Після оформлення кошик порожній, а замовлення видно клієнту.
         assert "порожній" in texts_to(await chat.say(CLIENT, bot.BTN_CART), CLIENT)[0]
@@ -279,6 +289,31 @@ def test_cancel_keeps_cart(run):
         assert "скасовано" in texts_to(await chat.say(CLIENT, bot.BTN_CANCEL), CLIENT)[0]
         assert "Футболка базова (чорна)" in texts_to(await chat.say(CLIENT, "/cart"), CLIENT)[0]
         assert app.bot_data["db"].recent_orders() == []
+
+    run(scenario)
+
+
+def test_repeat_order_reuses_contacts(run):
+    async def scenario(chat, app):
+        app.bot_data["db"].create_order(CLIENT, "user100", "Ольга", "0501234567",
+                                        "🏤 Нова Пошта — відділення, Київ, 5", [("Кепка", 390, 1)])
+        await chat.press(CLIENT, "add:2")
+        offer = texts_to(await chat.press(CLIENT, "checkout"), CLIENT)[0]
+        assert "ті самі дані" in offer and "Ольга" in offer and "Київ, 5" in offer
+
+        # Одна кнопка замість імені, телефону й адреси; коментар можна пропустити.
+        assert "оплатити" in texts_to(await chat.say(CLIENT, bot.BTN_SAME_DATA), CLIENT)[0]
+        await chat.say(CLIENT, "💵 Накладений платіж")
+        summary = texts_to(await chat.say(CLIENT, bot.BTN_SKIP), CLIENT)[0]
+        assert "Ольга" in summary and "Накладений платіж" in summary and "Коментар" not in summary
+        done = texts_to(await chat.say(CLIENT, bot.BTN_CONFIRM), CLIENT)[0]
+        assert "№2 прийнято" in done and "Реквізити" not in done
+        assert app.bot_data["db"].get_order(2)["delivery"] == "🏤 Нова Пошта — відділення, Київ, 5"
+
+        # «Ввести нові» веде до звичайних кроків.
+        await chat.press(CLIENT, "add:2")
+        await chat.press(CLIENT, "checkout")
+        assert "звертатися" in texts_to(await chat.say(CLIENT, bot.BTN_NEW_DATA), CLIENT)[0]
 
     run(scenario)
 

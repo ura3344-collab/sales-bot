@@ -57,3 +57,26 @@ def test_settings_survive_reopen(tmp_path):
     Storage(tmp_path / "s.db").set_setting("manager_id", "42")
     assert Storage(tmp_path / "s.db").get_setting("manager_id") == "42"
     assert Storage(tmp_path / "s.db").get_setting("missing") is None
+
+
+def test_payment_comment_and_last_contacts(db):
+    assert db.last_contacts(100) is None
+    make_order(db)
+    order_id = db.create_order(100, "olha", "Ольга К.", "0671112233", "Укрпошта, Львів", [("Кепка", 390, 1)],
+                               payment="Накладений платіж", comment="Після 18:00")
+    order = db.get_order(order_id)
+    assert order["payment"] == "Накладений платіж" and order["comment"] == "Після 18:00"
+    assert db.last_contacts(100) == {"name": "Ольга К.", "phone": "0671112233", "delivery": "Укрпошта, Львів"}
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT NOT NULL, "
+                 "user_id INTEGER NOT NULL, username TEXT, name TEXT NOT NULL, phone TEXT NOT NULL, "
+                 "delivery TEXT NOT NULL, total INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'new')")
+    conn.close()
+    db = Storage(path)
+    order_id = make_order(db)
+    assert db.get_order(order_id)["payment"] == ""
