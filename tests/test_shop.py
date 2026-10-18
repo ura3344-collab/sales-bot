@@ -32,6 +32,7 @@ def test_real_catalog_is_valid():
     assert all(p.price > 0 and p.title for p in items.values())
     # Для кожного товару справжнього каталогу є фото в photos/.
     assert [pid for pid in items if not shop.photo_path(pid)] == []
+    assert [p.id for p in items.values() if p.size_chart and not shop.chart_path(p)] == []
 
 
 def test_categories_models_and_variants(tmp_path):

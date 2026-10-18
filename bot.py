@@ -1,15 +1,18 @@
 """Безкоштовний Telegram-бот магазину: каталог, кошик, замовлення, панель менеджера.
 Запуск: python bot.py"""
 import hashlib
+import html
 import logging
 import os
 import re
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
@@ -31,6 +34,8 @@ BTN_CONTACTS = "📞 Контакти"
 BTN_MY_ORDERS = "📦 Мої замовлення"
 BTN_CANCEL = "❌ Скасувати"
 BTN_CONFIRM = "✅ Підтвердити"
+BTN_ASK_MANAGER = "📞 Замовити через менеджера"
+BTN_SIZE_CHART = "📏 Розмірна сітка"
 
 MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_DELIVERY, BTN_CONTACTS], [BTN_MY_ORDERS]],
                            resize_keyboard=True)
@@ -87,24 +92,44 @@ def models_view(products: dict[str, shop.Product], category: str) -> tuple[str, 
     return texts.MODELS_TITLE.format(category=category), InlineKeyboardMarkup(buttons)
 
 
-def product_caption(p: shop.Product) -> str:
-    stock = "" if p.in_stock else f" ({texts.OUT_OF_STOCK})"
-    color = f"\nКолір: {p.color}" if p.color else ""
-    return f"{p.model} — {p.price} грн{stock}{color}\n\n{p.description}"
+def product_caption(p: shop.Product, size: str = "") -> str:
+    lines = [f"{p.model} — {p.price} грн"]
+    if p.color:
+        lines.append(f"Колір: {p.color}")
+    if size:
+        lines.append(f"Розмір: {size}")
+    elif p.sizes:
+        lines.append(texts.CHOOSE_SIZE)
+    if p.needs_manager(size):
+        lines.append(texts.ON_REQUEST)
+    elif not p.in_stock:
+        lines.append(texts.OUT_OF_STOCK)
+    return "\n".join(lines) + f"\n\n{p.description}"
 
 
-def product_markup(p: shop.Product, products: dict[str, shop.Product], cart: dict[str, int]) -> InlineKeyboardMarkup:
+def product_markup(p: shop.Product, products: dict[str, shop.Product], cart: dict[str, int],
+                   size: str = "") -> InlineKeyboardMarkup:
+    """Кольори → розміри → розмірна сітка → «Додати» або «Замовити через менеджера» і кошик.
+    Вибраний розмір передається в кнопках, тож бот нічого не мусить запам'ятовувати."""
     rows = []
     variants = shop.variants(products, p)
     if len(variants) > 1:
-        colors = [InlineKeyboardButton(f"✓ {v.color}" if v.id == p.id else v.color, callback_data=f"v:{v.id}")
-                  for v in variants]
+        colors = [InlineKeyboardButton(("✓ " if v.id == p.id else "") + v.color + (" 🕓" if v.on_request else ""),
+                                       callback_data=f"v:{v.id}:{size}") for v in variants]
         rows += [colors[i:i + 3] for i in range(0, len(colors), 3)]
+    if p.sizes:
+        sizes = [InlineKeyboardButton(("✓ " if s == size else "") + s + (" 🕓" if s in p.request_sizes else ""),
+                                      callback_data=f"s:{p.id}:{s}") for s in p.sizes]
+        rows += [sizes[i:i + 4] for i in range(0, len(sizes), 4)]
+    if shop.chart_path(p):
+        rows.append([InlineKeyboardButton(BTN_SIZE_CHART, callback_data=f"chart:{p.id}")])
     row = []
-    if p.in_stock:
-        qty = cart.get(p.id, 0)
+    if p.needs_manager(size):
+        row.append(InlineKeyboardButton(BTN_ASK_MANAGER, callback_data=f"ask:{p.id}:{size}"))
+    elif p.in_stock:
+        qty = cart.get(shop.cart_key(p.id, size), 0)
         row.append(InlineKeyboardButton(f"➕ Додати (у кошику: {qty})" if qty else "➕ Додати",
-                                        callback_data=f"add:{p.id}"))
+                                        callback_data=f"add:{shop.cart_key(p.id, size)}"))
     row.append(InlineKeyboardButton(BTN_CART, callback_data="show"))
     rows.append(row)
     return InlineKeyboardMarkup(rows)
@@ -134,11 +159,11 @@ async def send_product(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Prod
 
 
 async def switch_variant(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Product,
-                         products: dict[str, shop.Product]) -> None:
-    """Показує інший колір у тій самій картці: міняє фото, підпис і кнопки."""
-    caption, markup = product_caption(p), product_markup(p, products, get_cart(context))
+                         products: dict[str, shop.Product], size: str = "", new_photo: bool = True) -> None:
+    """Оновлює ту саму картку: інший колір міняє фото, інший розмір — лише підпис і кнопки."""
+    caption, markup = product_caption(p, size), product_markup(p, products, get_cart(context), size)
     path = shop.photo_path(p.id)
-    if path and message.photo:
+    if path and message.photo and new_photo:
         key, photo = photo_input(context, path)
         sent = await message.edit_media(InputMediaPhoto(photo, caption=caption), reply_markup=markup)
         remember_photo(context, key, sent)
@@ -247,11 +272,14 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- Каталог (inline-кнопки) ----------
 
 async def catalog_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """cats — список розділів, c:<№> — моделі розділу, m:<id> — картка моделі, v:<id> — інший колір."""
+    """cats — розділи, c:<№> — моделі розділу, m:<id> — картка моделі,
+    v:<id>:<розмір> — інший колір, s:<id>:<розмір> — інший розмір, chart:<id> — розмірна сітка."""
     query = update.callback_query
     action, _, arg = query.data.partition(":")
+    pid, _, size = arg.partition(":")
     products = shop.load_products()
     categories = shop.categories(products)
+    p = products.get(pid)
     if action == "cats":
         await query.answer()
         text, markup = categories_view(products)
@@ -260,24 +288,61 @@ async def catalog_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer()
         text, markup = models_view(products, categories[int(arg)])
         await edit_or_ignore(query.edit_message_text(text, reply_markup=markup))
-    elif action == "m" and arg in products:
+    elif action == "m" and p:
         await query.answer()
-        await send_product(query.message, context, products[arg], products)
-    elif action == "v" and arg in products:
-        await query.answer(products[arg].color)
-        await switch_variant(query.message, context, products[arg], products)
+        await send_product(query.message, context, p, products)
+    elif action == "v" and p:
+        await query.answer(p.color)
+        await switch_variant(query.message, context, p, products, size if size in p.sizes else "")
+    elif action == "s" and p and size in p.sizes:
+        await query.answer(f"Розмір {size}")
+        await switch_variant(query.message, context, p, products, size, new_photo=False)
+    elif action == "chart" and p and shop.chart_path(p):
+        await query.answer()
+        key, photo = photo_input(context, shop.chart_path(p))
+        remember_photo(context, key, await query.message.reply_photo(
+            photo, caption=texts.SIZE_CHART.format(model=p.model)))
     else:
         await query.answer(texts.CATALOG_CHANGED, show_alert=True)
+
+
+async def ask_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Товар під замовлення: надсилаємо менеджеру запит, а клієнту — контакти."""
+    query = update.callback_query
+    pid, _, size = query.data.removeprefix("ask:").partition(":")
+    products = shop.load_products()
+    if pid not in products:
+        await query.answer(texts.CATALOG_CHANGED, show_alert=True)
+        return
+    await query.answer()
+    p = replace(products[pid], size=size)
+    user = update.effective_user
+    manager = manager_id(context)
+    if manager:
+        username = f"@{user.username}" if user.username else "немає"
+        try:
+            await context.bot.send_message(
+                manager,
+                f"{texts.NEW_REQUEST}\n\n{html.escape(p.title)} — {p.price} грн\n\n"
+                f"Клієнт: <a href=\"tg://user?id={user.id}\">{html.escape(user.full_name)}</a>\n"
+                f"Telegram: {username}",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            logging.exception("Не вдалося надіслати менеджеру запит на товар під замовлення")
+            manager = None
+    await query.message.reply_text(texts.ASK_SENT if manager else texts.ASK_CONTACTS, reply_markup=MENU)
 
 
 # ---------- Кошик (inline-кнопки) ----------
 
 async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    action, _, pid = query.data.partition(":")
+    # key — позиція кошика: id товару, а для одягу з розмірами ще й розмір ("12:M").
+    action, _, key = query.data.partition(":")
+    pid, size = shop.parse_key(key)
     products = shop.load_products()
     cart = get_cart(context)
-    available = pid in products and products[pid].in_stock
+    p = products.get(pid)
 
     if action == "noop":
         await query.answer()
@@ -285,21 +350,23 @@ async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         text, markup = cart_view(cart, products)
         await query.message.reply_text(text, reply_markup=markup)
-    elif action in ("add", "inc") and not available:
+    elif action == "add" and p and p.sizes and not size:
+        await query.answer(texts.CHOOSE_SIZE_FIRST, show_alert=True)
+    elif action in ("add", "inc") and not (p and p.can_buy(size)):
         await query.answer(texts.NOT_AVAILABLE, show_alert=True)
-    elif action in ("add", "inc") and cart.get(pid, 0) >= shop.MAX_QTY:
+    elif action in ("add", "inc") and cart.get(key, 0) >= shop.MAX_QTY:
         await query.answer(texts.MAX_QTY_REACHED, show_alert=True)
     elif action == "add":
-        cart[pid] = cart.get(pid, 0) + 1
-        await query.answer(f"Додано: {products[pid].title}")
-        await edit_or_ignore(query.edit_message_reply_markup(product_markup(products[pid], products, cart)))
+        cart[key] = cart.get(key, 0) + 1
+        await query.answer(f"Додано: {replace(p, size=size).title}")
+        await edit_or_ignore(query.edit_message_reply_markup(product_markup(p, products, cart, size)))
     else:
         if action == "inc":
-            cart[pid] = cart.get(pid, 0) + 1
-        elif action == "dec" and pid in cart:
-            cart[pid] -= 1
-            if cart[pid] <= 0:
-                del cart[pid]
+            cart[key] = cart.get(key, 0) + 1
+        elif action == "dec" and key in cart:
+            cart[key] -= 1
+            if cart[key] <= 0:
+                del cart[key]
         elif action == "clear":
             cart.clear()
         await query.answer()
@@ -512,8 +579,9 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
         fallbacks=[MessageHandler(cancel, order_cancel), CommandHandler("cancel", order_cancel)],
     ))
 
-    app.add_handler(CallbackQueryHandler(catalog_action, pattern=r"^(cats|c:\d+|m:\w+|v:\w+)$"))
-    app.add_handler(CallbackQueryHandler(cart_action, pattern=r"^(add|inc|dec):\w+$|^(show|clear|noop)$"))
+    app.add_handler(CallbackQueryHandler(catalog_action, pattern=r"^(cats|c:\d+|m:\w+|[vs]:\w+:[^:]*|chart:\w+)$"))
+    app.add_handler(CallbackQueryHandler(ask_manager, pattern=r"^ask:\w+:[^:]*$"))
+    app.add_handler(CallbackQueryHandler(cart_action, pattern=r"^(add|inc|dec):\w+(:[^:]+)?$|^(show|clear|noop)$"))
     app.add_handler(CallbackQueryHandler(manager_open_order, pattern=r"^ord:\d+$"))
     app.add_handler(CallbackQueryHandler(manager_set_status, pattern=r"^st:\d+:\w+$"))
 

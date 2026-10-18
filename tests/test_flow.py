@@ -174,7 +174,7 @@ def test_model_card_with_photos_and_colors(run, tmp_path, monkeypatch):
         assert "✓ Біла" in str(card["reply_markup"]) and "Чорна" in str(card["reply_markup"])
 
         # Інший колір — та сама картка з новим фото, підписом і позначкою ✓.
-        calls = await chat.press(CLIENT, "v:2", on_photo=True)
+        calls = await chat.press(CLIENT, "v:2:", on_photo=True)
         edit = next(p for name, p in calls if name == "editMessageMedia")
         assert "Колір: Чорна" in str(edit["media"]) and "✓ Чорна" in str(edit["reply_markup"])
 
@@ -196,6 +196,54 @@ def test_model_card_with_photos_and_colors(run, tmp_path, monkeypatch):
         # Застаріла кнопка після зміни каталогу не ламає бота.
         calls = await chat.press(CLIENT, "c:9")
         assert "Каталог оновився" in str(calls)
+
+    run(scenario)
+
+
+def test_sizes_chart_and_request_to_manager(run, tmp_path, monkeypatch):
+    photos = tmp_path / "photos"
+    (photos / "charts").mkdir(parents=True)
+    (photos / "charts" / "rio.jpg").write_bytes(b"fake jpeg")
+    (photos / "5.jpg").write_bytes(b"fake jpeg")
+    monkeypatch.setattr(bot.shop, "PHOTOS_DIR", photos)
+    monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+
+    def answer(calls):
+        return next(p.get("text", "") for name, p in calls if name == "answerCallbackQuery")
+
+    async def scenario(chat, app):
+        card = next(p for name, p in await chat.press(CLIENT, "m:5") if name == "sendPhoto")
+        assert "Оберіть розмір" in card["caption"]
+        markup = str(card["reply_markup"])
+        assert "XS 🕓" in markup and "s:5:M" in markup and "chart:5" in markup and "Інші кольори 🕓" in markup
+
+        # Без розміру одяг у кошик не додається.
+        assert "Спочатку оберіть розмір" in answer(await chat.press(CLIENT, "add:5", on_photo=True))
+
+        calls = await chat.press(CLIENT, "s:5:M", on_photo=True)
+        edit = next(p for name, p in calls if name == "editMessageCaption")
+        assert "Розмір: M" in edit["caption"] and "✓ M" in str(edit["reply_markup"])
+        await chat.press(CLIENT, "add:5:M", on_photo=True)
+        assert "Кітель Rio (білий, M)" in texts_to(await chat.say(CLIENT, "/cart"), CLIENT)[0]
+
+        # Розмір під замовлення: замість «Додати» — запит менеджеру.
+        edit = next(p for name, p in await chat.press(CLIENT, "s:5:XS", on_photo=True) if name == "editMessageCaption")
+        assert "Під замовлення" in edit["caption"]
+        assert "ask:5:XS" in str(edit["reply_markup"]) and "add:" not in str(edit["reply_markup"])
+        calls = await chat.press(CLIENT, "ask:5:XS", on_photo=True)
+        to_manager = texts_to(calls, MANAGER)[0]
+        assert "Кітель Rio (білий, XS)" in to_manager and f"tg://user?id={CLIENT}" in to_manager
+        assert "Запит надіслано" in texts_to(calls, CLIENT)[0]
+
+        # Колір під замовлення: розмір зберігається, купити можна лише через менеджера.
+        edit = next(p for name, p in await chat.press(CLIENT, "v:6:M", on_photo=True) if name == "editMessageCaption")
+        assert "Інші кольори" in edit["caption"] and "Розмір: M" in edit["caption"]
+        assert "ask:6:M" in str(edit["reply_markup"])
+        assert "немає в наявності" in answer(await chat.press(CLIENT, "add:6:M", on_photo=True))
+        assert "Інші кольори" not in texts_to(await chat.say(CLIENT, "/cart"), CLIENT)[0]
+
+        calls = await chat.press(CLIENT, "chart:5", on_photo=True)
+        assert [p["caption"] for name, p in calls if name == "sendPhoto"] == ["📏 Розмірна сітка: Кітель Rio"]
 
     run(scenario)
 

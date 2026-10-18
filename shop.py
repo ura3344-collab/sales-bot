@@ -1,7 +1,7 @@
 """Каталог, кошик і розпізнавання тем — чиста логіка без Telegram."""
 import csv
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import texts
@@ -14,7 +14,7 @@ MAX_QTY = 20
 
 @dataclass(frozen=True)
 class Product:
-    """Один варіант товару, який можна покласти в кошик: модель певного кольору."""
+    """Один варіант товару: модель певного кольору. У кошику — ще й певного розміру (size)."""
     id: str
     category: str
     model: str
@@ -22,28 +22,49 @@ class Product:
     price: int
     in_stock: bool
     description: str
+    on_request: bool = False          # «під замовлення»: купується лише через менеджера
+    sizes: tuple[str, ...] = ()       # усі розміри моделі, порожньо — розмір не потрібен
+    request_sizes: frozenset[str] = frozenset()  # розміри, що шиються під замовлення
+    size_chart: str = ""              # файл у photos/charts/
+    size: str = ""
 
     @property
     def title(self) -> str:
-        return f"{self.model} ({self.color.lower()})" if self.color else self.model
+        details = ", ".join(x for x in (self.color.lower(), self.size) if x)
+        return f"{self.model} ({details})" if details else self.model
+
+    def needs_manager(self, size: str = "") -> bool:
+        return self.on_request or size in self.request_sizes
+
+    def can_buy(self, size: str = "") -> bool:
+        """Чи можна покласти в кошик: є в наявності, не під замовлення, розмір вибрано правильно."""
+        size_ok = size in self.sizes if self.sizes else not size
+        return self.in_stock and size_ok and not self.needs_manager(size)
 
 
 def load_products(path: Path | None = None) -> dict[str, Product]:
     # Файл читається щоразу, тож зміни в products.csv діють без перезапуску бота.
     with open(path or PRODUCTS_FILE, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
-    return {
-        r["id"].strip(): Product(
+    products = {}
+    for r in rows:
+        # Розміри через пробіл; зірочка позначає розмір під замовлення: "XS* S M L XL 2XL 3XL*".
+        sizes = (r.get("розміри") or "").split()
+        availability = r["в_наявності"].strip().lower()
+        products[r["id"].strip()] = Product(
             id=r["id"].strip(),
             category=r["розділ"].strip(),
             model=r["модель"].strip(),
             color=r["колір"].strip(),
             price=int(r["ціна_грн"]),
-            in_stock=r["в_наявності"].strip().lower() == "так",
+            in_stock=availability == "так",
             description=r["опис"].strip(),
+            on_request=availability == "під замовлення",
+            sizes=tuple(s.rstrip("*") for s in sizes),
+            request_sizes=frozenset(s.rstrip("*") for s in sizes if s.endswith("*")),
+            size_chart=(r.get("розмірна_сітка") or "").strip(),
         )
-        for r in rows
-    }
+    return products
 
 
 def categories(products: dict[str, Product]) -> list[str]:
@@ -74,10 +95,30 @@ def photo_path(product_id: str, photos_dir: Path | None = None) -> Path | None:
     return None
 
 
+def chart_path(product: Product) -> Path | None:
+    """Розмірна сітка моделі — файл photos/charts/<розмірна_сітка з products.csv>."""
+    path = PHOTOS_DIR / "charts" / product.size_chart
+    return path if product.size_chart and path.is_file() else None
+
+
+def cart_key(product_id: str, size: str = "") -> str:
+    return f"{product_id}:{size}" if size else product_id
+
+
+def parse_key(key: str) -> tuple[str, str]:
+    """Ключ кошика "12:M" → ("12", "M"); без розміру — "12" → ("12", "")."""
+    product_id, _, size = key.partition(":")
+    return product_id, size
+
+
 def cart_lines(cart: dict[str, int], products: dict[str, Product]) -> list[tuple[Product, int]]:
-    """Позиції кошика, які досі можна купити (товар існує і є в наявності)."""
-    return [(products[pid], qty) for pid, qty in cart.items()
-            if qty > 0 and pid in products and products[pid].in_stock]
+    """Позиції кошика, які досі можна купити. id позиції — ключ кошика, size — вибраний розмір."""
+    lines = []
+    for key, qty in cart.items():
+        pid, size = parse_key(key)
+        if qty > 0 and pid in products and products[pid].can_buy(size):
+            lines.append((replace(products[pid], id=key, size=size), qty))
+    return lines
 
 
 def cart_total(lines: list[tuple[Product, int]]) -> int:
