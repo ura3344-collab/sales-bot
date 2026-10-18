@@ -27,6 +27,8 @@ def test_real_catalog_is_valid():
     items = shop.load_products()
     assert items
     assert all(p.price > 0 and p.title for p in items.values())
+    # Для кожного товару справжнього каталогу є фото в photos/.
+    assert [pid for pid in items if not shop.photo_path(pid)] == []
 
 
 def test_cart_skips_unavailable_and_unknown(tmp_path):

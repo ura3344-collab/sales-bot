@@ -71,17 +71,33 @@ async def edit_or_ignore(coro) -> None:
 
 # ---------- Вигляд повідомлень ----------
 
-def catalog_view(products: dict[str, shop.Product], cart: dict[str, int]) -> tuple[str, InlineKeyboardMarkup]:
-    lines = [texts.CATALOG_TITLE, ""]
-    buttons = []
-    for p in products.values():
-        stock = "" if p.in_stock else f" ({texts.OUT_OF_STOCK})"
-        lines.append(f"• {p.title} — {p.price} грн{stock}\n   {p.description}")
-        if p.in_stock:
-            buttons.append([InlineKeyboardButton(f"➕ {p.title} — {p.price} грн", callback_data=f"add:{p.id}")])
-    count = sum(qty for _, qty in shop.cart_lines(cart, products))
-    buttons.append([InlineKeyboardButton(f"{BTN_CART} ({count})", callback_data="show")])
-    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+def product_caption(p: shop.Product) -> str:
+    stock = "" if p.in_stock else f" ({texts.OUT_OF_STOCK})"
+    return f"{p.title} — {p.price} грн{stock}\n{p.description}"
+
+
+def product_markup(p: shop.Product, cart: dict[str, int]) -> InlineKeyboardMarkup:
+    row = []
+    if p.in_stock:
+        qty = cart.get(p.id, 0)
+        row.append(InlineKeyboardButton(f"➕ Додати (у кошику: {qty})" if qty else "➕ Додати",
+                                        callback_data=f"add:{p.id}"))
+    row.append(InlineKeyboardButton(BTN_CART, callback_data="show"))
+    return InlineKeyboardMarkup([row])
+
+
+async def send_product(message, context: ContextTypes.DEFAULT_TYPE, p: shop.Product, cart: dict[str, int]) -> None:
+    caption, markup = product_caption(p), product_markup(p, cart)
+    path = shop.photo_path(p.id)
+    if not path:
+        await message.reply_text(caption, reply_markup=markup)
+        return
+    # Файл завантажується в Telegram один раз, далі надсилаємо його file_id — так швидше.
+    # У ключі є час зміни файлу, тож нове фото з тією ж назвою підхопиться саме.
+    cache = context.bot_data.setdefault("photo_ids", {})
+    key = (str(path), path.stat().st_mtime_ns)
+    sent = await message.reply_photo(cache.get(key, path), caption=caption, reply_markup=markup)
+    cache[key] = sent.photo[-1].file_id
 
 
 def items_text(items: list[tuple[str, int, int]]) -> str:
@@ -129,8 +145,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text, markup = catalog_view(shop.load_products(), get_cart(context))
-    await update.message.reply_text(text, reply_markup=markup)
+    cart = get_cart(context)
+    await update.message.reply_text(texts.CATALOG_TITLE)
+    for p in shop.load_products().values():
+        await send_product(update.message, context, p, cart)
 
 
 async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,8 +217,7 @@ async def cart_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "add":
         cart[pid] = cart.get(pid, 0) + 1
         await query.answer(f"Додано: {products[pid].title}")
-        _, markup = catalog_view(products, cart)
-        await edit_or_ignore(query.edit_message_reply_markup(markup))
+        await edit_or_ignore(query.edit_message_reply_markup(product_markup(products[pid], cart)))
     else:
         if action == "inc":
             cart[pid] = cart.get(pid, 0) + 1

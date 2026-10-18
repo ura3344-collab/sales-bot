@@ -7,6 +7,8 @@ from pathlib import Path
 import texts
 
 PRODUCTS_FILE = Path(__file__).parent / "products.csv"
+PHOTOS_DIR = Path(__file__).parent / "photos"
+PHOTO_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 MAX_QTY = 20
 
 
@@ -19,9 +21,9 @@ class Product:
     description: str
 
 
-def load_products(path: Path = PRODUCTS_FILE) -> dict[str, Product]:
+def load_products(path: Path | None = None) -> dict[str, Product]:
     # Файл читається щоразу, тож зміни в products.csv діють без перезапуску бота.
-    with open(path, encoding="utf-8-sig") as f:
+    with open(path or PRODUCTS_FILE, encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     return {
         r["id"].strip(): Product(
@@ -33,6 +35,15 @@ def load_products(path: Path = PRODUCTS_FILE) -> dict[str, Product]:
         )
         for r in rows
     }
+
+
+def photo_path(product_id: str, photos_dir: Path | None = None) -> Path | None:
+    """Фото товару — файл photos/<id>.jpg (або .jpeg/.png/.webp). Немає файлу — немає фото."""
+    for ext in PHOTO_EXTS:
+        path = (photos_dir or PHOTOS_DIR) / f"{product_id}{ext}"
+        if path.is_file():
+            return path
+    return None
 
 
 def cart_lines(cart: dict[str, int], products: dict[str, Product]) -> list[tuple[Product, int]]:

@@ -2,6 +2,7 @@
 Telegram підмінено фальшивим транспортом, тому тест не потребує ні токена, ні мережі."""
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from telegram import Update
@@ -36,6 +37,11 @@ class FakeRequest(BaseRequest):
             result = {"message_id": len(self.calls), "date": 0,
                       "chat": {"id": params.get("chat_id", 1), "type": "private"},
                       "text": params.get("text", "")}
+        elif name == "sendPhoto":
+            result = {"message_id": len(self.calls), "date": 0,
+                      "chat": {"id": params.get("chat_id", 1), "type": "private"},
+                      "caption": params.get("caption", ""),
+                      "photo": [{"file_id": "PHOTO_ID", "file_unique_id": "u", "width": 1, "height": 1}]}
         else:
             result = True
         return 200, json.dumps({"ok": True, "result": result}).encode()
@@ -78,6 +84,9 @@ def texts_to(calls, chat_id):
 @pytest.fixture
 def run(tmp_path, monkeypatch):
     monkeypatch.delenv("MANAGER_ID", raising=False)
+    # Тести працюють на власному тестовому каталозі без фото, щоб не залежати від справжнього асортименту.
+    monkeypatch.setattr(bot.shop, "PRODUCTS_FILE", Path(__file__).parent / "products.csv")
+    monkeypatch.setattr(bot.shop, "PHOTOS_DIR", tmp_path / "no-photos")
 
     def runner(scenario):
         async def wrapped():
@@ -97,8 +106,8 @@ def test_full_order_flow(run):
         assert "Вітаю" in texts_to(await chat.say(CLIENT, "/start"), CLIENT)[0]
         assert "Менеджера" not in texts_to(await chat.say(MANAGER, "/manager"), MANAGER)[0]
 
-        catalog = texts_to(await chat.say(CLIENT, bot.BTN_CATALOG), CLIENT)[0]
-        assert "Худі оверсайз сіре — 1290 грн" in catalog
+        catalog = texts_to(await chat.say(CLIENT, bot.BTN_CATALOG), CLIENT)
+        assert "Худі оверсайз сіре — 1290 грн" in "\n".join(catalog)
 
         # Товару №4 немає в наявності — у кошик він не потрапляє.
         await chat.press(CLIENT, "add:4")
@@ -138,6 +147,32 @@ def test_full_order_flow(run):
         assert "№1" in texts_to(await chat.say(MANAGER, "/orders"), MANAGER)[0]
         stats = texts_to(await chat.say(MANAGER, "/stats"), MANAGER)[0]
         assert "Замовлень: 1" in stats and "1740 грн" in stats
+
+    run(scenario)
+
+
+def test_catalog_sends_photo_cards(run, tmp_path, monkeypatch):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    (photos / "3.jpg").write_bytes(b"fake jpeg")
+    monkeypatch.setattr(bot.shop, "PHOTOS_DIR", photos)
+
+    async def scenario(chat, app):
+        calls = await chat.say(CLIENT, "/catalog")
+        sent = [(name, p.get("caption") or p.get("text")) for name, p in calls if name in ("sendMessage", "sendPhoto")]
+        # Заголовок і по картці на кожен товар; фото є лише в худі.
+        assert len(sent) == 5
+        assert [c for name, c in sent if name == "sendPhoto"] == [
+            "Худі оверсайз сіре — 1290 грн\nТринитка з начосом, розміри M–XL"]
+
+        # Удруге фото не завантажується, а йде за file_id від Telegram.
+        calls = await chat.say(CLIENT, "/catalog")
+        assert [p["photo"] for name, p in calls if name == "sendPhoto"] == ["PHOTO_ID"]
+
+        # Кнопка на картці показує, скільки цього товару вже в кошику.
+        calls = await chat.press(CLIENT, "add:3")
+        markup = next(p["reply_markup"] for name, p in calls if name == "editMessageReplyMarkup")
+        assert "у кошику: 1" in str(markup)
 
     run(scenario)
 
