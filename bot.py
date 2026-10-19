@@ -72,8 +72,15 @@ def manager_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
     return int(value) if value else None
 
 
+def orders_chat_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    # Окрема група для нових замовлень; без неї замовлення йдуть менеджеру в особистий чат.
+    value = os.getenv("ORDERS_CHAT_ID", "").strip() or storage(context).get_setting("orders_chat_id")
+    return int(value) if value else None
+
+
 def is_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return update.effective_chat.id == manager_id(context)
+    chat = update.effective_chat.id
+    return chat == manager_id(context) or chat == orders_chat_id(context)
 
 
 async def edit_or_ignore(coro) -> None:
@@ -578,7 +585,7 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     cart.clear()
     cancel_cart_reminder(context, user.id)
 
-    manager = manager_id(context)
+    manager = orders_chat_id(context) or manager_id(context)
     if manager:
         try:
             await context.bot.send_message(
@@ -614,6 +621,19 @@ async def become_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(texts.MANAGER_ALREADY)
     else:
         await update.message.reply_text(texts.MANAGER_TAKEN)
+
+
+async def set_orders_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Викликається в групі: перевіряємо саме людину, бо чат групи ще не відомий боту.
+    if update.effective_user.id != manager_id(context):
+        await update.message.reply_text(texts.MANAGER_ONLY)
+        return
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(texts.ORDERS_CHAT_GROUP_ONLY)
+        return
+    chat_id = update.effective_chat.id
+    storage(context).set_setting("orders_chat_id", str(chat_id))
+    await update.message.reply_text(texts.ORDERS_CHAT_SET.format(id=chat_id))
 
 
 async def manager_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -822,6 +842,7 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(CommandHandler("cart", show_cart))
     app.add_handler(CommandHandler("myorders", my_orders))
     app.add_handler(CommandHandler("manager", become_manager))
+    app.add_handler(CommandHandler("orderschat", set_orders_chat))
     app.add_handler(CommandHandler("orders", manager_orders))
     app.add_handler(CommandHandler("stats", manager_stats))
     app.add_handler(CommandHandler("report", manager_report))

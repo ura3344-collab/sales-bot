@@ -13,3 +13,5 @@ services:
         sync: false
       - key: MANAGER_ID
         sync: false
+      - key: ORDERS_CHAT_ID
+        sync: false

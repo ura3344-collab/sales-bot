@@ -62,8 +62,10 @@ class Chat:
         await self.app.process_update(Update.de_json({"update_id": self.update_id, **payload}, self.app.bot))
         return list(self.request.calls)
 
-    async def say(self, user_id, text):
-        message = {"message_id": self.update_id + 1, "date": 0, "chat": {"id": user_id, "type": "private"},
+    async def say(self, user_id, text, group=None):
+        """group — ID групи, якщо повідомлення надіслано в групі, а не в особистому чаті."""
+        chat = {"id": group, "type": "group", "title": "Замовлення"} if group else {"id": user_id, "type": "private"}
+        message = {"message_id": self.update_id + 1, "date": 0, "chat": chat,
                    "from": self._user(user_id), "text": text}
         if text.startswith("/"):
             message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text)}]
@@ -89,6 +91,7 @@ def texts_to(calls, chat_id):
 @pytest.fixture
 def run(tmp_path, monkeypatch):
     monkeypatch.delenv("MANAGER_ID", raising=False)
+    monkeypatch.delenv("ORDERS_CHAT_ID", raising=False)
     # Тести працюють на власному тестовому каталозі без фото, щоб не залежати від справжнього асортименту.
     monkeypatch.setattr(bot.shop, "PRODUCTS_FILE", Path(__file__).parent / "products.csv")
     monkeypatch.setattr(bot.shop, "PHOTOS_DIR", tmp_path / "no-photos")
@@ -280,6 +283,34 @@ def test_manager_id_from_env_ignores_whitespace(run, monkeypatch):
     async def scenario(chat, app):
         monkeypatch.setenv("MANAGER_ID", f" {MANAGER}\n")
         assert "Замовлень ще немає" in texts_to(await chat.say(MANAGER, "/orders"), MANAGER)[0]
+
+    run(scenario)
+
+
+def test_orders_go_to_separate_group(run, monkeypatch):
+    group = -1001
+
+    async def scenario(chat, app):
+        monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+        # Призначити групу може лише менеджер і лише в групі.
+        assert "лише менеджеру" in texts_to(await chat.say(STRANGER, "/orderschat", group=group), group)[0]
+        assert "в групі" in texts_to(await chat.say(MANAGER, "/orderschat"), MANAGER)[0]
+        assert f"ORDERS_CHAT_ID = {group}" in texts_to(await chat.say(MANAGER, "/orderschat", group=group), group)[0]
+
+        await chat.press(CLIENT, "add:1")
+        await chat.press(CLIENT, "checkout")
+        for answer in ("Ольга", "050 123 45 67", "📦 Нова Пошта — поштомат", "Київ, 1234",
+                       bot.texts.PAYMENT_METHODS[0], bot.BTN_SKIP):
+            await chat.say(CLIENT, answer)
+        calls = await chat.say(CLIENT, bot.BTN_CONFIRM)
+        assert "Нове замовлення" in texts_to(calls, group)[0]
+        assert not texts_to(calls, MANAGER)
+
+        # Статус можна змінити кнопкою прямо в групі.
+        await chat._send({"callback_query": {
+            "id": "g", "from": chat._user(MANAGER), "chat_instance": "x", "data": "st:1:shipped",
+            "message": {"message_id": 1, "date": 0, "text": "…", "chat": {"id": group, "type": "group", "title": "Замовлення"}}}})
+        assert app.bot_data["db"].get_order(1)["status"] == "shipped"
 
     run(scenario)
 
