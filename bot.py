@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, ChatMigrated, Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
 from telegram.warnings import PTBUserWarning
@@ -74,7 +74,8 @@ def manager_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
 
 def orders_chat_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
     # Окрема група для нових замовлень; без неї замовлення йдуть менеджеру в особистий чат.
-    value = os.getenv("ORDERS_CHAT_ID", "").strip() or storage(context).get_setting("orders_chat_id")
+    # Збережене в базі значення новіше за ORDERS_CHAT_ID: його ставить /orderschat або зміна номера групи.
+    value = storage(context).get_setting("orders_chat_id") or os.getenv("ORDERS_CHAT_ID", "").strip()
     return int(value) if value else None
 
 
@@ -570,6 +571,34 @@ async def order_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return CONFIRM
 
 
+async def send_new_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+    group, manager = orders_chat_id(context), manager_id(context)
+    if not (group or manager):
+        logging.warning("Менеджера не призначено — замовлення №%s збережено лише в базі", order_id)
+        return
+    text = f"{texts.NEW_ORDER}\n\n{order_card(storage(context).get_order(order_id))}"
+    if group:
+        try:
+            try:
+                await context.bot.send_message(group, text, reply_markup=status_keyboard(order_id))
+            except ChatMigrated as e:
+                # Telegram перетворив групу на супергрупу й видав їй новий номер — запам'ятовуємо його.
+                storage(context).set_setting("orders_chat_id", str(e.new_chat_id))
+                await context.bot.send_message(e.new_chat_id, text, reply_markup=status_keyboard(order_id))
+                if manager:
+                    await context.bot.send_message(manager, texts.ORDERS_CHAT_MIGRATED.format(id=e.new_chat_id))
+            return
+        except Exception:
+            logging.exception("Не вдалося надіслати замовлення №%s у групу %s", order_id, group)
+            if not manager:
+                return
+            text = f"{texts.ORDERS_CHAT_FAILED}\n\n{text}"
+    try:
+        await context.bot.send_message(manager, text, reply_markup=status_keyboard(order_id))
+    except Exception:
+        logging.exception("Не вдалося надіслати замовлення менеджеру")
+
+
 async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     order = context.user_data.pop("order")
     cart = get_cart(context)
@@ -585,16 +614,7 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     cart.clear()
     cancel_cart_reminder(context, user.id)
 
-    manager = orders_chat_id(context) or manager_id(context)
-    if manager:
-        try:
-            await context.bot.send_message(
-                manager, f"{texts.NEW_ORDER}\n\n{order_card(storage(context).get_order(order_id))}",
-                reply_markup=status_keyboard(order_id))
-        except Exception:
-            logging.exception("Не вдалося надіслати замовлення менеджеру")
-    else:
-        logging.warning("Менеджера не призначено — замовлення №%s збережено лише в базі", order_id)
+    await send_new_order(context, order_id)
 
     done = texts.ORDER_DONE.format(id=order_id)
     if order["payment"] == texts.PAYMENT_METHODS[1]:

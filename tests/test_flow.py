@@ -16,6 +16,8 @@ CLIENT, MANAGER, STRANGER = 100, 200, 300
 class FakeRequest(BaseRequest):
     def __init__(self):
         self.calls = []
+        # chat_id -> відповідь Telegram з помилкою, щоб імітувати збої надсилання в конкретний чат.
+        self.errors = {}
 
     @property
     def read_timeout(self):
@@ -31,6 +33,8 @@ class FakeRequest(BaseRequest):
         name = url.rsplit("/", 1)[1]
         params = request_data.parameters if request_data else {}
         self.calls.append((name, params))
+        if params.get("chat_id") in self.errors:
+            return 400, json.dumps({"ok": False, "error_code": 400, **self.errors[params["chat_id"]]}).encode()
         if name == "getMe":
             result = {"id": 1, "is_bot": True, "first_name": "Test", "username": "test_bot"}
         elif name in ("sendMessage", "editMessageText", "editMessageReplyMarkup", "sendDocument"):
@@ -287,6 +291,16 @@ def test_manager_id_from_env_ignores_whitespace(run, monkeypatch):
     run(scenario)
 
 
+async def place_order(chat, client=CLIENT):
+    """Новий клієнт швидко оформлює замовлення; повертає виклики бота після підтвердження."""
+    await chat.press(client, "add:1")
+    await chat.press(client, "checkout")
+    for answer in ("Ольга", "050 123 45 67", "📦 Нова Пошта — поштомат", "Київ, 1234",
+                   bot.texts.PAYMENT_METHODS[0], bot.BTN_SKIP):
+        await chat.say(client, answer)
+    return await chat.say(client, bot.BTN_CONFIRM)
+
+
 def test_orders_go_to_separate_group(run, monkeypatch):
     group = -1001
 
@@ -297,12 +311,7 @@ def test_orders_go_to_separate_group(run, monkeypatch):
         assert "в групі" in texts_to(await chat.say(MANAGER, "/orderschat"), MANAGER)[0]
         assert f"ORDERS_CHAT_ID = {group}" in texts_to(await chat.say(MANAGER, "/orderschat", group=group), group)[0]
 
-        await chat.press(CLIENT, "add:1")
-        await chat.press(CLIENT, "checkout")
-        for answer in ("Ольга", "050 123 45 67", "📦 Нова Пошта — поштомат", "Київ, 1234",
-                       bot.texts.PAYMENT_METHODS[0], bot.BTN_SKIP):
-            await chat.say(CLIENT, answer)
-        calls = await chat.say(CLIENT, bot.BTN_CONFIRM)
+        calls = await place_order(chat)
         assert "Нове замовлення" in texts_to(calls, group)[0]
         assert not texts_to(calls, MANAGER)
 
@@ -311,6 +320,43 @@ def test_orders_go_to_separate_group(run, monkeypatch):
             "id": "g", "from": chat._user(MANAGER), "chat_instance": "x", "data": "st:1:shipped",
             "message": {"message_id": 1, "date": 0, "text": "…", "chat": {"id": group, "type": "group", "title": "Замовлення"}}}})
         assert app.bot_data["db"].get_order(1)["status"] == "shipped"
+
+    run(scenario)
+
+
+def test_orders_follow_group_upgraded_to_supergroup(run, monkeypatch):
+    old, new = -1001, -1009
+
+    async def scenario(chat, app):
+        # ORDERS_CHAT_ID на хостингу ще зі старим номером групи.
+        monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+        monkeypatch.setenv("ORDERS_CHAT_ID", str(old))
+        chat.request.errors[old] = {"description": "Bad Request: group chat was upgraded to a supergroup chat",
+                                    "parameters": {"migrate_to_chat_id": new}}
+        calls = await place_order(chat)
+        assert "Нове замовлення" in texts_to(calls, new)[0]
+        assert f"ORDERS_CHAT_ID = {new}" in texts_to(calls, MANAGER)[0]
+
+        # Наступне замовлення одразу йде на новий номер, а кнопки статусу в новій групі працюють.
+        calls = await place_order(chat, client=CLIENT + 1)
+        assert "Нове замовлення" in texts_to(calls, new)[0] and not texts_to(calls, old)
+        await chat._send({"callback_query": {
+            "id": "g", "from": chat._user(MANAGER), "chat_instance": "x", "data": "st:2:shipped",
+            "message": {"message_id": 1, "date": 0, "text": "…", "chat": {"id": new, "type": "supergroup", "title": "Замовлення"}}}})
+        assert app.bot_data["db"].get_order(2)["status"] == "shipped"
+
+    run(scenario)
+
+
+def test_order_reaches_manager_when_group_fails(run, monkeypatch):
+    group = -1001
+
+    async def scenario(chat, app):
+        monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+        monkeypatch.setenv("ORDERS_CHAT_ID", str(group))
+        chat.request.errors[group] = {"description": "Forbidden: bot was kicked from the group chat"}
+        to_manager = texts_to(await place_order(chat), MANAGER)[0]
+        assert "Не вдалося надіслати замовлення в групу" in to_manager and "Нове замовлення" in to_manager
 
     run(scenario)
 
