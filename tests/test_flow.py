@@ -1,10 +1,12 @@
 """Наскрізний сценарій: клієнт збирає кошик і оформлює замовлення, менеджер змінює статус.
 Telegram підмінено фальшивим транспортом, тому тест не потребує ні токена, ні мережі."""
 import asyncio
+import io
 import json
 from pathlib import Path
 
 import pytest
+from PIL import Image, ImageDraw
 from telegram import Update
 from telegram.request import BaseRequest
 
@@ -18,6 +20,8 @@ class FakeRequest(BaseRequest):
         self.calls = []
         # chat_id -> відповідь Telegram з помилкою, щоб імітувати збої надсилання в конкретний чат.
         self.errors = {}
+        # file_id -> вміст файлу, який клієнт нібито надіслав боту.
+        self.files = {}
 
     @property
     def read_timeout(self):
@@ -35,7 +39,11 @@ class FakeRequest(BaseRequest):
         self.calls.append((name, params))
         if params.get("chat_id") in self.errors:
             return 400, json.dumps({"ok": False, "error_code": 400, **self.errors[params["chat_id"]]}).encode()
-        if name == "getMe":
+        if name.removesuffix(".bin") in self.files:
+            return 200, self.files[name.removesuffix(".bin")]
+        if name == "getFile":
+            result = {"file_id": params["file_id"], "file_unique_id": "u", "file_path": f"{params['file_id']}.bin"}
+        elif name == "getMe":
             result = {"id": 1, "is_bot": True, "first_name": "Test", "username": "test_bot"}
         elif name in ("sendMessage", "editMessageText", "editMessageReplyMarkup", "sendDocument"):
             result = {"message_id": len(self.calls), "date": 0,
@@ -75,6 +83,16 @@ class Chat:
             message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text)}]
         return await self._send({"message": message})
 
+    async def send_file(self, user_id, file_id, document=False):
+        """Клієнт надсилає зображення: стиснуте фото або файлом (document)."""
+        message = {"message_id": self.update_id + 1, "date": 0, "chat": {"id": user_id, "type": "private"},
+                   "from": self._user(user_id)}
+        if document:
+            message["document"] = {"file_id": file_id, "file_unique_id": "d", "mime_type": "image/png"}
+        else:
+            message["photo"] = [{"file_id": file_id, "file_unique_id": "p", "width": 1, "height": 1}]
+        return await self._send({"message": message})
+
     async def press(self, user_id, data, on_photo=False):
         """Натискання inline-кнопки; on_photo — кнопка під фото, а не під текстом."""
         message = {"message_id": 1, "date": 0, "chat": {"id": user_id, "type": "private"},
@@ -96,6 +114,7 @@ def texts_to(calls, chat_id):
 def run(tmp_path, monkeypatch):
     monkeypatch.delenv("MANAGER_ID", raising=False)
     monkeypatch.delenv("ORDERS_CHAT_ID", raising=False)
+    monkeypatch.setattr(bot.logo, "SPOTS_FILE", Path(__file__).parent / "logo_spots.csv")
     # Тести працюють на власному тестовому каталозі без фото, щоб не залежати від справжнього асортименту.
     monkeypatch.setattr(bot.shop, "PRODUCTS_FILE", Path(__file__).parent / "products.csv")
     monkeypatch.setattr(bot.shop, "PHOTOS_DIR", tmp_path / "no-photos")
@@ -357,6 +376,76 @@ def test_order_reaches_manager_when_group_fails(run, monkeypatch):
         chat.request.errors[group] = {"description": "Forbidden: bot was kicked from the group chat"}
         to_manager = texts_to(await place_order(chat), MANAGER)[0]
         assert "Не вдалося надіслати замовлення в групу" in to_manager and "Нове замовлення" in to_manager
+
+    run(scenario)
+
+
+def jpeg(color, size=(100, 150), draw=None):
+    img = Image.new("RGB", size, color)
+    if draw:
+        draw(ImageDraw.Draw(img))
+    out = io.BytesIO()
+    img.save(out, "JPEG")
+    return out.getvalue()
+
+
+def captions(calls, chat_id, method="sendPhoto"):
+    return [p.get("caption") or str(p.get("media")) for name, p in calls
+            if name == method and p.get("chat_id") == chat_id]
+
+
+def test_logo_preview_and_request(run, tmp_path, monkeypatch):
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for pid, color in (("1", "white"), ("2", "black"), ("5", "white")):
+        (photos / f"{pid}.jpg").write_bytes(jpeg(color))
+    monkeypatch.setattr(bot.shop, "PHOTOS_DIR", photos)
+
+    async def scenario(chat, app):
+        monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+        chat.request.files["LOGO"] = jpeg("white", (200, 100), lambda d: d.rectangle((40, 30, 160, 70), fill="black"))
+        chat.request.files["BAD"] = b"not an image"
+
+        # Меню показує лише вироби з розміченими фото; на картці товару є кнопка приміряти логотип.
+        models = texts_to(await chat.say(CLIENT, bot.BTN_LOGO), CLIENT)
+        assert "Оберіть виріб" in models[0]
+        calls = await chat.say(CLIENT, bot.BTN_LOGO)
+        assert "Футболка базова" in str(calls) and "Кітель Rio" in str(calls) and "Худі" not in str(calls)
+        assert "lg:1" in str(await chat.press(CLIENT, "m:1"))
+
+        # Спершу виріб, потім логотип — і бот одразу показує візуалізацію.
+        assert "Надішліть логотип" in texts_to(await chat.press(CLIENT, "lg:2"), CLIENT)[0]
+        calls = await chat.send_file(CLIENT, "LOGO")
+        preview = captions(calls, CLIENT)[0]
+        assert "Футболка базова (чорна)" in preview and "10 см, груди" in preview
+        # Чорний логотип на чорній тканині перефарбовується, щоб його було видно.
+        assert "перефарбовано" in preview
+        markup = str(next(p["reply_markup"] for name, p in calls if name == "sendPhoto"))
+        assert "✓ 10 см" in markup and "✓ Груди" in markup and "Низ фартуха" in markup and "✓ Чорна" in markup
+
+        # Розмір, місце й колір змінюють ту саму картинку.
+        assert "25 см, груди" in captions(await chat.press(CLIENT, "lgs:25", on_photo=True), CLIENT, "editMessageMedia")[0]
+        assert "25 см, низ фартуха" in captions(await chat.press(CLIENT, "lgw:bottom", on_photo=True), CLIENT,
+                                                "editMessageMedia")[0]
+        white = captions(await chat.press(CLIENT, "lgc:1", on_photo=True), CLIENT, "editMessageMedia")[0]
+        assert "Футболка базова (біла)" in white and "перефарбовано" not in white
+
+        # Кітель: низу фартуха немає, тож місце й розмір підлаштовуються (на грудях — до 10 см).
+        kitel = captions(await chat.press(CLIENT, "lg:5"), CLIENT)[0]
+        assert "Кітель Rio (білий)" in kitel and "10 см, груди праворуч" in kitel
+
+        # Запит менеджеру: візуалізація з параметрами і оригінал логотипа.
+        calls = await chat.press(CLIENT, "lgo", on_photo=True)
+        to_manager = captions(calls, MANAGER)
+        assert "Запит на нанесення логотипа" in to_manager[0] and "10 см, груди праворуч" in to_manager[0]
+        assert to_manager[1] == "Оригінал логотипа"
+        assert [p["photo"] for name, p in calls if name == "sendPhoto"] == ["OLD", "LOGO"]
+        assert "Менеджер отримав візуалізацію" in texts_to(calls, CLIENT)[0]
+
+        # Не зображення — бот просить інший файл, а кнопки старої картинки просять надіслати логотип знову.
+        assert "Не вдалося розпізнати" in texts_to(await chat.send_file(CLIENT, "BAD", document=True), CLIENT)[0]
+        calls = await chat.press(CLIENT, "lgs:7", on_photo=True)
+        assert any(name == "answerCallbackQuery" and "ще раз" in p.get("text", "") for name, p in calls)
 
     run(scenario)
 

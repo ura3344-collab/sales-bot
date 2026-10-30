@@ -1,5 +1,6 @@
 """Безкоштовний Telegram-бот магазину: каталог, кошик, замовлення, панель менеджера.
 Запуск: python bot.py"""
+import asyncio
 import hashlib
 import html
 import logging
@@ -14,12 +15,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton,
                       ReplyKeyboardMarkup, Update)
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, ChatMigrated, Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
 from telegram.warnings import PTBUserWarning
 
+import logo
 import reports
 import shop
 import texts
@@ -43,8 +45,13 @@ BTN_WRITE_MANAGER = "💬 Написати менеджеру"
 BTN_SAME_DATA = "✅ Так, ті самі дані"
 BTN_NEW_DATA = "✏️ Ввести нові"
 BTN_SKIP = "⏭ Пропустити"
+BTN_LOGO = "🎨 Логотип на одязі"
+BTN_TRY_LOGO = "🎨 Приміряти логотип"
+BTN_NEW_LOGO = "🔄 Інший логотип"
+BTN_OTHER_ITEM = "👕 Інший виріб"
+BTN_LOGO_ORDER = "✅ Замовити з логотипом"
 
-MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_DELIVERY, BTN_CONTACTS], [BTN_MY_ORDERS]],
+MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_DELIVERY, BTN_CONTACTS], [BTN_LOGO, BTN_MY_ORDERS]],
                            resize_keyboard=True)
 CANCEL_KB = ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True)
 PHONE_KB = ReplyKeyboardMarkup([[KeyboardButton("📱 Надіслати мій номер", request_contact=True)], [BTN_CANCEL]],
@@ -163,6 +170,8 @@ def product_markup(p: shop.Product, products: dict[str, shop.Product], cart: dic
         rows += [sizes[i:i + 4] for i in range(0, len(sizes), 4)]
     if shop.chart_path(p):
         rows.append([InlineKeyboardButton(BTN_SIZE_CHART, callback_data=f"chart:{p.id}")])
+    if p.id in logo.load_placements():
+        rows.append([InlineKeyboardButton(BTN_TRY_LOGO, callback_data=f"lg:{p.id}")])
     row = []
     if p.needs_manager(size):
         row.append(InlineKeyboardButton(BTN_ASK_MANAGER, callback_data=f"ask:{p.id}:{size}"))
@@ -409,6 +418,174 @@ async def ask_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.message.reply_text(texts.ASK_SENT if manager else texts.ASK_CONTACTS, reply_markup=manager_chat_markup())
 
 
+# ---------- Логотип на одязі ----------
+# Стан клієнта — у user_data["logo"]: pid (виріб), size (см), spot (місце), file_id і kind (photo/document)
+# надісланого логотипа, art — вже підготовлений логотип, щоб не обробляти його при кожному натисканні.
+
+def logo_models_view(products: dict[str, shop.Product]) -> tuple[str, InlineKeyboardMarkup]:
+    models = logo.logo_products(products, logo.load_placements())
+    buttons = [[InlineKeyboardButton(model, callback_data=f"lg:{variants[0].id}")] for model, variants in models.items()]
+    return texts.LOGO_CHOOSE_MODEL, InlineKeyboardMarkup(buttons)
+
+
+def logo_markup(p: shop.Product, products: dict[str, shop.Product], placements: dict[str, logo.Placement],
+                state: dict) -> InlineKeyboardMarkup:
+    """Кольори виробу → розміри логотипа → місця → інший логотип / виріб → замовити."""
+    rows = []
+    variants = logo.logo_products(products, placements).get(p.model, [])
+    if len(variants) > 1:
+        colors = [InlineKeyboardButton(("✓ " if v.id == p.id else "") + v.color, callback_data=f"lgc:{v.id}")
+                  for v in variants]
+        rows += [colors[i:i + 3] for i in range(0, len(colors), 3)]
+    largest = texts.LOGO_SPOTS[state["spot"]][1]
+    rows.append([InlineKeyboardButton(("✓ " if cm == state["size"] else "") + f"{cm} см", callback_data=f"lgs:{cm}")
+                 for cm in texts.LOGO_SIZES if cm <= largest])
+    spots = [InlineKeyboardButton(("✓ " if s == state["spot"] else "") + texts.LOGO_SPOTS[s][0], callback_data=f"lgw:{s}")
+             for s in placements[p.id].spots]
+    if len(spots) > 1:
+        rows.append(spots)
+    rows.append([InlineKeyboardButton(BTN_NEW_LOGO, callback_data="lgn"),
+                 InlineKeyboardButton(BTN_OTHER_ITEM, callback_data="lgm")])
+    rows.append([InlineKeyboardButton(BTN_LOGO_ORDER, callback_data="lgo")])
+    return InlineKeyboardMarkup(rows)
+
+
+def choose_logo_item(state: dict, pid: str, placements: dict[str, logo.Placement]) -> None:
+    """Новий виріб: місце лишається, якщо воно в нього є, а розмір — якщо вміщається на це місце."""
+    spots = list(placements[pid].spots)
+    if state.get("spot") not in spots:
+        state["spot"] = spots[0]
+    state["size"] = min(state.get("size", texts.LOGO_DEFAULT_SIZE), texts.LOGO_SPOTS[state["spot"]][1])
+    state["pid"] = pid
+
+
+async def logo_preview(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       state: dict) -> tuple[bytes, str, InlineKeyboardMarkup] | None:
+    """Готує візуалізацію; якщо логотип не вдалося розпізнати — повідомляє клієнта й повертає None."""
+    products, placements = shop.load_products(), logo.load_placements()
+    p = products[state["pid"]]
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    if "art" not in state:
+        data = await (await context.bot.get_file(state["file_id"])).download_as_bytearray()
+        try:
+            state["art"] = await asyncio.to_thread(logo.prepare_logo, bytes(data))
+        except ValueError:
+            state.pop("file_id", None)
+            await update.effective_message.reply_text(texts.LOGO_BAD_FILE)
+            return None
+    jpg, recolored = await asyncio.to_thread(logo.render, shop.photo_path(p.id), state["art"],
+                                             placements[p.id], state["spot"], state["size"])
+    caption = texts.LOGO_CAPTION.format(title=p.title, price=p.price, size=state["size"],
+                                        spot=texts.LOGO_SPOTS[state["spot"]][0].lower())
+    if recolored:
+        caption += "\n\n" + texts.LOGO_RECOLORED
+    return jpg, f"{caption}\n\n{texts.LOGO_HINT}", logo_markup(p, products, placements, state)
+
+
+async def logo_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, markup = logo_models_view(shop.load_products())
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def logo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    state = context.user_data.setdefault("logo", {})
+    if message.photo:
+        state.update(file_id=message.photo[-1].file_id, kind="photo")
+    else:
+        state.update(file_id=message.document.file_id, kind="document")
+    state.pop("art", None)
+    if state.get("pid") not in logo.load_placements():
+        text, markup = logo_models_view(shop.load_products())
+        await message.reply_text(text, reply_markup=markup)
+        return
+    preview = await logo_preview(update, context, state)
+    if preview:
+        jpg, caption, markup = preview
+        await message.reply_photo(jpg, caption=caption, reply_markup=markup)
+
+
+async def logo_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """lg:<id> — обрати виріб, lgc:<id> — інший колір, lgs:<см> — розмір, lgw:<місце> — місце,
+    lgn — інший логотип, lgm — інший виріб, lgo — надіслати менеджеру."""
+    query = update.callback_query
+    action, _, arg = query.data.partition(":")
+    state = context.user_data.setdefault("logo", {})
+    products, placements = shop.load_products(), logo.load_placements()
+
+    if action == "lgm":
+        await query.answer()
+        text, markup = logo_models_view(products)
+        await query.message.reply_text(text, reply_markup=markup)
+        return
+    if action == "lgn":
+        await query.answer()
+        state.pop("file_id", None)
+        state.pop("art", None)
+        await query.message.reply_text(texts.LOGO_SEND)
+        return
+    if action in ("lg", "lgc"):
+        if arg not in placements or arg not in products:
+            await query.answer(texts.CATALOG_CHANGED, show_alert=True)
+            return
+        choose_logo_item(state, arg, placements)
+        if "file_id" not in state:
+            await query.answer()
+            await query.message.reply_text(texts.LOGO_SEND)
+            return
+    elif "file_id" not in state or state.get("pid") not in placements:
+        # Після перезапуску бота стан губиться — просимо надіслати логотип ще раз.
+        await query.answer(texts.LOGO_EXPIRED, show_alert=True)
+        return
+    elif action == "lgs" and arg.isdigit() and int(arg) in texts.LOGO_SIZES:
+        state["size"] = min(int(arg), texts.LOGO_SPOTS[state["spot"]][1])
+    elif action == "lgw" and arg in placements[state["pid"]].spots:
+        state["spot"] = arg
+        state["size"] = min(state["size"], texts.LOGO_SPOTS[arg][1])
+    elif action == "lgo":
+        await send_logo_request(update, context, state)
+        return
+    else:
+        await query.answer()
+        return
+
+    await query.answer()
+    preview = await logo_preview(update, context, state)
+    if not preview:
+        return
+    jpg, caption, markup = preview
+    # Вибір виробу зі списку чи картки — нове повідомлення; зміна кольору, розміру, місця — оновлення картинки.
+    if action == "lg" or not query.message.photo:
+        await query.message.reply_photo(jpg, caption=caption, reply_markup=markup)
+    else:
+        await query.message.edit_media(InputMediaPhoto(jpg, caption=caption), reply_markup=markup)
+
+
+async def send_logo_request(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict) -> None:
+    """Менеджер отримує візуалізацію, параметри й оригінал логотипа для виробництва."""
+    query = update.callback_query
+    await query.answer()
+    p = shop.load_products()[state["pid"]]
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else "немає"
+    caption = (f"{texts.LOGO_NEW_REQUEST}\n\n{html.escape(p.title)} — {p.price} грн\n"
+               f"Логотип: {state['size']} см, {texts.LOGO_SPOTS[state['spot']][0].lower()}\n\n"
+               f"Клієнт: <a href=\"tg://user?id={user.id}\">{html.escape(user.full_name)}</a>\n"
+               f"Telegram: {username}")
+    preview = query.message.photo[-1].file_id
+
+    async def send(chat_id: int, note: str) -> None:
+        await context.bot.send_photo(chat_id, preview, caption=f"{note}\n\n{caption}" if note else caption,
+                                     parse_mode=ParseMode.HTML)
+        if state["kind"] == "document":
+            await context.bot.send_document(chat_id, state["file_id"], caption=texts.LOGO_ORIGINAL)
+        else:
+            await context.bot.send_photo(chat_id, state["file_id"], caption=texts.LOGO_ORIGINAL)
+
+    sent = await notify_orders(context, send)
+    await query.message.reply_text(texts.LOGO_SENT if sent else texts.ASK_CONTACTS, reply_markup=manager_chat_markup())
+
+
 # ---------- Кошик (inline-кнопки) ----------
 
 def schedule_cart_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
@@ -571,32 +748,43 @@ async def order_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return CONFIRM
 
 
-async def send_new_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+async def notify_orders(context: ContextTypes.DEFAULT_TYPE, send) -> bool:
+    """Надсилає в групу замовлень, а якщо її немає чи вона недоступна — менеджеру в особистий чат.
+    send(chat_id, note) робить саме надсилання; note — пояснення, чому повідомлення прийшло не в групу.
+    Повертає False, якщо надіслати не вдалося нікому."""
     group, manager = orders_chat_id(context), manager_id(context)
-    if not (group or manager):
-        logging.warning("Менеджера не призначено — замовлення №%s збережено лише в базі", order_id)
-        return
-    text = f"{texts.NEW_ORDER}\n\n{order_card(storage(context).get_order(order_id))}"
     if group:
         try:
             try:
-                await context.bot.send_message(group, text, reply_markup=status_keyboard(order_id))
+                await send(group, "")
             except ChatMigrated as e:
                 # Telegram перетворив групу на супергрупу й видав їй новий номер — запам'ятовуємо його.
                 storage(context).set_setting("orders_chat_id", str(e.new_chat_id))
-                await context.bot.send_message(e.new_chat_id, text, reply_markup=status_keyboard(order_id))
+                await send(e.new_chat_id, "")
                 if manager:
                     await context.bot.send_message(manager, texts.ORDERS_CHAT_MIGRATED.format(id=e.new_chat_id))
-            return
+            return True
         except Exception:
-            logging.exception("Не вдалося надіслати замовлення №%s у групу %s", order_id, group)
-            if not manager:
-                return
-            text = f"{texts.ORDERS_CHAT_FAILED}\n\n{text}"
+            logging.exception("Не вдалося надіслати в групу замовлень %s", group)
+    if not manager:
+        return False
     try:
-        await context.bot.send_message(manager, text, reply_markup=status_keyboard(order_id))
+        await send(manager, texts.ORDERS_CHAT_FAILED if group else "")
+        return True
     except Exception:
-        logging.exception("Не вдалося надіслати замовлення менеджеру")
+        logging.exception("Не вдалося надіслати менеджеру")
+        return False
+
+
+async def send_new_order(context: ContextTypes.DEFAULT_TYPE, order_id: int) -> None:
+    text = f"{texts.NEW_ORDER}\n\n{order_card(storage(context).get_order(order_id))}"
+
+    async def send(chat_id: int, note: str) -> None:
+        await context.bot.send_message(chat_id, f"{note}\n\n{text}" if note else text,
+                                       reply_markup=status_keyboard(order_id))
+
+    if not await notify_orders(context, send):
+        logging.warning("Замовлення №%s не надіслано нікому — воно збережене лише в базі", order_id)
 
 
 async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -814,6 +1002,7 @@ async def set_commands(app: Application) -> None:
         BotCommand("catalog", "Каталог товарів"),
         BotCommand("cart", "Кошик"),
         BotCommand("myorders", "Мої замовлення"),
+        BotCommand("logo", "Приміряти логотип"),
         BotCommand("cancel", "Скасувати оформлення"),
     ])
 
@@ -854,6 +1043,7 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(CallbackQueryHandler(rate_order, pattern=r"^rate:\d+:[1-5]$"))
     app.add_handler(CallbackQueryHandler(ask_manager, pattern=r"^ask:\w+:[^:]*$"))
     app.add_handler(CallbackQueryHandler(cart_action, pattern=r"^(add|inc|dec):\w+(:[^:]+)?$|^(show|clear|noop)$"))
+    app.add_handler(CallbackQueryHandler(logo_action, pattern=r"^lg[cswnmo]?(:\w+)?$"))
     app.add_handler(CallbackQueryHandler(manager_open_order, pattern=r"^ord:\d+$"))
     app.add_handler(CallbackQueryHandler(manager_set_status, pattern=r"^st:\d+:\w+$"))
 
@@ -861,6 +1051,7 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(CommandHandler("catalog", catalog))
     app.add_handler(CommandHandler("cart", show_cart))
     app.add_handler(CommandHandler("myorders", my_orders))
+    app.add_handler(CommandHandler("logo", logo_start))
     app.add_handler(CommandHandler("manager", become_manager))
     app.add_handler(CommandHandler("orderschat", set_orders_chat))
     app.add_handler(CommandHandler("orders", manager_orders))
@@ -872,6 +1063,9 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(MessageHandler(button(BTN_DELIVERY), delivery))
     app.add_handler(MessageHandler(button(BTN_CONTACTS), contacts))
     app.add_handler(MessageHandler(button(BTN_MY_ORDERS), my_orders))
+    app.add_handler(MessageHandler(button(BTN_LOGO), logo_start))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.IMAGE),
+                                   logo_received))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
     app.add_error_handler(on_error)
 

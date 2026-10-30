@@ -3,3 +3,4 @@ python-dotenv
 tzdata
 openpyxl
 psycopg[binary]
+Pillow
