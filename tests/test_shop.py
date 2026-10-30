@@ -1,3 +1,5 @@
+import pytest
+
 import shop
 import texts
 
@@ -64,6 +66,20 @@ def test_find_topic():
     assert shop.find_topic("покажи кошик") == "cart"
     assert shop.find_topic("дякую!") == "thanks"
     assert shop.find_topic("абракадабра") is None
+
+
+@pytest.mark.parametrize("text, topic", [
+    ("Можна замовити 30 фартухів зі знижкою?", "manager"),
+    ("Хочу поговорити з живою людиною", "manager"),
+    ("Чи можна нанести наш логотип?", "logo"),
+    ("Робите вишивку на кітелях?", "logo"),
+    ("Ти бот?", "who"),
+    ("Який розмір кітеля мені підійде?", "sizes"),
+    ("Скільки триває доставка, які терміни?", "delivery"),
+    ("До котрої ви працюєте?", "contacts"),
+])
+def test_find_topic_assistant_answers(text, topic):
+    assert shop.find_topic(text) == topic
 
 
 def test_search_by_name_and_color(tmp_path):

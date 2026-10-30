@@ -366,6 +366,10 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "delivery": texts.DELIVERY,
         "contacts": texts.CONTACTS,
         "order": texts.ORDER_HINT,
+        "manager": texts.MANAGER_HINT,
+        "logo": texts.LOGO_ANSWER,
+        "sizes": texts.SIZES_ANSWER,
+        "who": texts.WHO_ANSWER,
         "thanks": texts.THANKS,
         "greeting": texts.WELCOME,
     }
