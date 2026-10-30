@@ -54,8 +54,8 @@ BTN_LOGO_ORDER = "✅ Замовити з логотипом"
 BTN_CALL_MANAGER = "💬 Зв'язатися з менеджером"
 RECENT_MESSAGES = 5  # скільки останніх повідомлень клієнта бачить менеджер у запиті на зв'язок
 
-MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_LOGO, BTN_MY_ORDERS], [BTN_DELIVERY, BTN_CONTACTS],
-                            [BTN_CALL_MANAGER]],
+# Під полем введення — лише зв'язок з менеджером; решту клієнт відкриває, написавши Анні, або командами.
+MENU = ReplyKeyboardMarkup([[BTN_CALL_MANAGER]],
                            resize_keyboard=True)
 CANCEL_KB = ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True)
 PHONE_KB = ReplyKeyboardMarkup([[KeyboardButton("📱 Надіслати мій номер", request_contact=True)], [BTN_CANCEL]],
@@ -361,6 +361,10 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if topic == "cart":
         await show_cart(update, context)
+        return
+    if topic == "logo":
+        _, markup = logo_models_view(shop.load_products())
+        await update.message.reply_text(texts.LOGO_ANSWER, reply_markup=markup)
         return
     answers = {
         "delivery": texts.DELIVERY,
