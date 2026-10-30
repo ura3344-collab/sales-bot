@@ -4,3 +4,4 @@ tzdata
 openpyxl
 psycopg[binary]
 Pillow
+anthropic

@@ -15,3 +15,5 @@ services:
         sync: false
       - key: ORDERS_CHAT_ID
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false

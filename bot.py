@@ -21,6 +21,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           ConversationHandler, MessageHandler, filters)
 from telegram.warnings import PTBUserWarning
 
+import assistant
 import logo
 import reports
 import shop
@@ -50,8 +51,11 @@ BTN_TRY_LOGO = "🎨 Приміряти логотип"
 BTN_NEW_LOGO = "🔄 Інший логотип"
 BTN_OTHER_ITEM = "👕 Інший виріб"
 BTN_LOGO_ORDER = "✅ Замовити з логотипом"
+BTN_CALL_MANAGER = "💬 Зв'язатися з менеджером"
+RECENT_MESSAGES = 5  # скільки останніх повідомлень клієнта бачить менеджер у запиті на зв'язок
 
-MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_DELIVERY, BTN_CONTACTS], [BTN_LOGO, BTN_MY_ORDERS]],
+MENU = ReplyKeyboardMarkup([[BTN_CATALOG, BTN_CART], [BTN_LOGO, BTN_MY_ORDERS], [BTN_DELIVERY, BTN_CONTACTS],
+                            [BTN_CALL_MANAGER]],
                            resize_keyboard=True)
 CANCEL_KB = ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True)
 PHONE_KB = ReplyKeyboardMarkup([[KeyboardButton("📱 Надіслати мій номер", request_contact=True)], [BTN_CANCEL]],
@@ -326,7 +330,25 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    topic = shop.find_topic(update.message.text)
+    question = update.message.text
+    recent = context.user_data.setdefault("recent", [])
+    recent.append(question[:300])
+    del recent[:-RECENT_MESSAGES]
+
+    if assistant.enabled():
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        history = context.user_data.setdefault("anna", [])
+        answer = await assistant.reply(history, question)
+        if answer:
+            assistant.remember(history, question, answer)
+            # Питання про конкретний товар — під відповіддю кнопки, що відкривають його картку.
+            found = shop.search(shop.load_products(), question)
+            markup = InlineKeyboardMarkup(product_buttons(found[:texts.SEARCH_LIMIT])) if found else MENU
+            await update.message.reply_text(answer, reply_markup=markup)
+            return
+        # Claude недоступний — відповідаємо за ключовими словами, як без Анни.
+
+    topic = shop.find_topic(question)
     # «Latte бежевий», «купити кітель Rio» — шукаємо товар; питання про доставку чи контакти — ні.
     if topic in (None, "prices", "order"):
         found = shop.search(shop.load_products(), update.message.text)
@@ -348,6 +370,31 @@ async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "greeting": texts.WELCOME,
     }
     await update.message.reply_text(answers.get(topic, texts.UNKNOWN), reply_markup=MENU)
+
+
+async def call_manager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Менеджер отримує запит на зв'язок разом з останніми повідомленнями клієнта, щоб не перепитувати."""
+    now = datetime.now().timestamp()
+    if now - context.user_data.get("manager_called", 0) < texts.MANAGER_CALL_COOLDOWN_MIN * 60:
+        await update.message.reply_text(texts.MANAGER_CALL_REPEAT, reply_markup=manager_chat_markup())
+        return
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else "немає"
+    text = (f"{texts.MANAGER_CALL_REQUEST}\n\n"
+            f"Клієнт: <a href=\"tg://user?id={user.id}\">{html.escape(user.full_name)}</a>\n"
+            f"Telegram: {username}")
+    recent = context.user_data.get("recent", [])
+    if recent:
+        text += f"\n\n{texts.MANAGER_CALL_HISTORY}\n" + "\n".join(f"• {html.escape(m)}" for m in recent)
+
+    async def send(chat_id: int, note: str) -> None:
+        await context.bot.send_message(chat_id, f"{note}\n\n{text}" if note else text, parse_mode=ParseMode.HTML)
+
+    sent = await notify_orders(context, send)
+    if sent:
+        context.user_data["manager_called"] = now
+    await update.message.reply_text(texts.MANAGER_CALL_SENT if sent else texts.ASK_CONTACTS,
+                                    reply_markup=manager_chat_markup())
 
 
 # ---------- Каталог (inline-кнопки) ----------
@@ -1064,6 +1111,7 @@ def build_app(token: str, db_path: Path | str, request=None) -> Application:
     app.add_handler(MessageHandler(button(BTN_CONTACTS), contacts))
     app.add_handler(MessageHandler(button(BTN_MY_ORDERS), my_orders))
     app.add_handler(MessageHandler(button(BTN_LOGO), logo_start))
+    app.add_handler(MessageHandler(button(BTN_CALL_MANAGER), call_manager))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.IMAGE),
                                    logo_received))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))

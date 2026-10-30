@@ -114,6 +114,7 @@ def texts_to(calls, chat_id):
 def run(tmp_path, monkeypatch):
     monkeypatch.delenv("MANAGER_ID", raising=False)
     monkeypatch.delenv("ORDERS_CHAT_ID", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(bot.logo, "SPOTS_FILE", Path(__file__).parent / "logo_spots.csv")
     # Тести працюють на власному тестовому каталозі без фото, щоб не залежати від справжнього асортименту.
     monkeypatch.setattr(bot.shop, "PRODUCTS_FILE", Path(__file__).parent / "products.csv")
@@ -134,7 +135,7 @@ def run(tmp_path, monkeypatch):
 
 def test_full_order_flow(run):
     async def scenario(chat, app):
-        assert "Вітаю" in texts_to(await chat.say(CLIENT, "/start"), CLIENT)[0]
+        assert "Анна" in texts_to(await chat.say(CLIENT, "/start"), CLIENT)[0]
         assert "Менеджера" not in texts_to(await chat.say(MANAGER, "/manager"), MANAGER)[0]
 
         calls = await chat.say(CLIENT, bot.BTN_CATALOG)
@@ -446,6 +447,46 @@ def test_logo_preview_and_request(run, tmp_path, monkeypatch):
         assert "Не вдалося розпізнати" in texts_to(await chat.send_file(CLIENT, "BAD", document=True), CLIENT)[0]
         calls = await chat.press(CLIENT, "lgs:7", on_photo=True)
         assert any(name == "answerCallbackQuery" and "ще раз" in p.get("text", "") for name, p in calls)
+
+    run(scenario)
+
+
+def test_anna_answers_and_falls_back(run, monkeypatch):
+    asked = []
+
+    async def fake_reply(history, question):
+        asked.append((list(history), question))
+        return None if question == "доставка?" else f"Анна: {question}"
+
+    async def scenario(chat, app):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+        monkeypatch.setattr(bot.assistant, "reply", fake_reply)
+        calls = await chat.say(CLIENT, "Добрий день")
+        assert texts_to(calls, CLIENT) == ["Анна: Добрий день"]
+        # Питання про товар — відповідь Анни і кнопка, що відкриває картку товару.
+        calls = await chat.say(CLIENT, "Худі оверсайз є?")
+        assert texts_to(calls, CLIENT) == ["Анна: Худі оверсайз є?"] and "m:3" in str(calls)
+        # Анна пам'ятає розмову.
+        assert asked[1][0] == [{"role": "user", "content": "Добрий день"},
+                               {"role": "assistant", "content": "Анна: Добрий день"}]
+        # Claude недоступний — бот відповідає сам, за ключовими словами.
+        assert "Доставка та оплата" in texts_to(await chat.say(CLIENT, "доставка?"), CLIENT)[0]
+
+    run(scenario)
+
+
+def test_call_manager_button(run, monkeypatch):
+    async def scenario(chat, app):
+        monkeypatch.setenv("MANAGER_ID", str(MANAGER))
+        await chat.say(CLIENT, "Чи можна пошити 30 фартухів зі знижкою?")
+        calls = await chat.say(CLIENT, bot.BTN_CALL_MANAGER)
+        to_manager = texts_to(calls, MANAGER)[0]
+        assert "просить зв'язатися" in to_manager and "@user100" in to_manager
+        assert "30 фартухів зі знижкою" in to_manager
+        assert "передала ваш запит" in texts_to(calls, CLIENT)[0]
+        # Повторне натискання не засипає менеджера однаковими запитами.
+        calls = await chat.say(CLIENT, bot.BTN_CALL_MANAGER)
+        assert not texts_to(calls, MANAGER) and "уже отримав" in texts_to(calls, CLIENT)[0]
 
     run(scenario)
 
